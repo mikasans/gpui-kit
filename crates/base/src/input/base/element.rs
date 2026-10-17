@@ -48,9 +48,13 @@ fn diagnostic_highlight_style(
 
 const BOTTOM_MARGIN_ROWS: usize = 3;
 pub(super) const RIGHT_MARGIN: Pixels = px(10.);
-pub(super) const LINE_NUMBER_RIGHT_MARGIN: Pixels = px(6.);
-const FOLD_ICON_WIDTH: Pixels = px(14.);
-const FOLD_ICON_HITBOX_WIDTH: Pixels = px(18.);
+/// Gap between the last digit and the fold column (VS Code–like gutter rhythm).
+pub(super) const LINE_NUMBER_RIGHT_MARGIN: Pixels = px(8.);
+/// Painted chevron size inside the fold hitbox.
+const FOLD_ICON_WIDTH: Pixels = px(16.);
+/// Fold-column width / click target (taller uses line height). Was 18×icon —
+/// too easy to miss between digits and text; 24px matches a roomier VS Code fold gutter.
+const FOLD_ICON_HITBOX_WIDTH: Pixels = px(24.);
 const MAX_HIGHLIGHT_LINE_LENGTH: usize = 10_000;
 const MIN_LINE_NUMBER_DIGITS: usize = 3;
 const MAX_LINE_NUMBER_DIGITS: usize = 7;
