@@ -3038,7 +3038,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Only a columnar selection needs the third value; everywhere else a position past
     /// the end of a row means the end of that row, and
     /// [`Self::index_for_mouse_position`] is the call to make.
-    pub(super) fn resolve_mouse_position(&self, position: Point<Pixels>) -> (usize, bool, usize) {
+    pub fn resolve_mouse_position(&self, position: Point<Pixels>) -> (usize, bool, usize) {
         // If the text is empty, always return 0
         if self.text.len() == 0 {
             return (0, false, 0);
@@ -10137,7 +10137,82 @@ impl InputBaseState<crate::input::EditorMode> {
         cx.notify();
     }
 
-    /// Unfold any folded ranges that hide the given position.
+    /// Toggle the fold whose start line is `start_line`.
+    ///
+    /// Returns `false` when folding is off or `start_line` is not a candidate.
+    pub fn toggle_fold(&mut self, start_line: usize, cx: &mut Context<Self>) -> bool {
+        if !self.mode.is_folding() || !self.display_map.is_fold_candidate(start_line) {
+            return false;
+        }
+        self.display_map.toggle_fold(start_line);
+        cx.notify();
+        true
+    }
+
+    /// Fold ranges for the buffer line under `position` (VS Code's Fold).
+    ///
+    /// Prefers a candidate that starts on that line; otherwise the innermost
+    /// candidate that covers it. Returns whether a fold was applied.
+    pub fn fold_at(&mut self, position: impl Into<Position>, cx: &mut Context<Self>) -> bool {
+        if !self.mode.is_folding() {
+            return false;
+        }
+        let offset = self.text.position_to_offset(&position.into());
+        let line = self.text.offset_to_point(offset).row;
+        let candidates = self.display_map.fold_candidates();
+        let start = candidates
+            .iter()
+            .find(|c| c.start_line == line)
+            .map(|c| c.start_line)
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .filter(|c| line > c.start_line && line < c.end_line)
+                    .max_by_key(|c| c.start_line)
+                    .map(|c| c.start_line)
+            });
+        let Some(start_line) = start else {
+            return false;
+        };
+        if self.display_map.is_folded_at(start_line) {
+            return false;
+        }
+        self.display_map.set_folded(start_line, true);
+        cx.notify();
+        true
+    }
+
+    /// Unfold the fold at `position` (VS Code's Unfold): open a fold that
+    /// starts on that line, or any fold that hides it.
+    pub fn unfold_line_at(
+        &mut self,
+        position: impl Into<Position>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.mode.is_folding() {
+            return false;
+        }
+        let offset = self.text.position_to_offset(&position.into());
+        let line = self.text.offset_to_point(offset).row;
+        let mut opened = false;
+        if self.display_map.is_folded_at(line) {
+            self.display_map.set_folded(line, false);
+            opened = true;
+        }
+        if self.unfold_at(Position::new(line as u32, 0), cx) {
+            opened = true;
+        } else if opened {
+            cx.notify();
+        }
+        opened
+    }
+
+    /// Fold candidates currently offered for this buffer.
+    pub fn fold_candidates(&self) -> &[crate::input::FoldRange] {
+        self.display_map.fold_candidates()
+    }
+
+        /// Unfold any folded ranges that hide the given position.
     ///
     /// Use this to reveal a position before acting on it (e.g. before
     /// [`Self::set_cursor_position`], which stops at a fold boundary),

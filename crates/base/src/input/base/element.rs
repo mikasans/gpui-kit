@@ -7,7 +7,7 @@ use gpui::{
 };
 use gpui::{
     HighlightStyle, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, LayoutId,
-    LongPressEvent, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement as _, Path, Pixels,
+    DispatchPhase, LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Path, Pixels,
     Point, Position, ShapedLine, SharedString, Size, Style, Styled as _, TextAlign, TextRun,
     TextStyle, TouchDragEvent, TouchPhase, UnderlineStyle, Window, fill, point, px, relative, size,
 };
@@ -417,8 +417,13 @@ fn empty_bottom_height(
 struct FoldIconLayout {
     /// Hitbox for the line number area (used for hover detection)
     line_number_hitbox: Hitbox,
-    /// List of (display_row, is_folded, icon_element) pairs for each fold candidate
-    icons: Vec<(usize, bool, gpui::AnyElement)>,
+    /// Fold candidates in view: buffer line, folded state, hit bounds, and icon.
+    ///
+    /// Bounds are kept so click handlers can be armed even when the chevron is
+    /// not painted (hover-only affordance). Without that, `icon.paint` is skipped
+    /// and InteractiveElement mouse listeners never register — chevrons look
+    /// clickable but do nothing.
+    icons: Vec<(usize, bool, Bounds<Pixels>, gpui::AnyElement)>,
 }
 
 pub(super) struct TextElement<M: InputModeKind> {
@@ -1270,7 +1275,6 @@ impl<M: InputModeKind> TextElement<M> {
         struct FoldInfo {
             buffer_line: usize,
             is_folded: bool,
-            display_row: usize,
             offset_y: Pixels,
         }
 
@@ -1306,7 +1310,6 @@ impl<M: InputModeKind> TextElement<M> {
                     infos.push(FoldInfo {
                         buffer_line,
                         is_folded,
-                        display_row: buffer_line,
                         offset_y,
                     });
                 }
@@ -1368,22 +1371,12 @@ impl<M: InputModeKind> TextElement<M> {
                     .size(FOLD_ICON_WIDTH)
                     .into_any_element()
                 });
+            // Visual only: click handling is registered in `paint_fold_icons`
+            // for every candidate, including ones whose chevron is hidden.
             let mut icon = gpui::div()
                 .id(("fold", ix))
                 .size(FOLD_ICON_WIDTH)
                 .child(child)
-                .on_mouse_down(MouseButton::Left, {
-                    let state = self.state.clone();
-                    let buffer_line = info.buffer_line;
-                    move |_, _: &mut Window, cx: &mut App| {
-                        cx.stop_propagation();
-
-                        state.update(cx, |state, cx| {
-                            state.display_map.toggle_fold(buffer_line);
-                            cx.notify();
-                        });
-                    }
-                })
                 .into_any_element();
 
             icon.prepaint_as_root(
@@ -1393,9 +1386,12 @@ impl<M: InputModeKind> TextElement<M> {
                 cx,
             );
 
-            icon_layout
-                .icons
-                .push((info.display_row, info.is_folded, icon));
+            icon_layout.icons.push((
+                info.buffer_line,
+                info.is_folded,
+                fold_icon_bounds,
+                icon,
+            ));
         }
 
         icon_layout
@@ -1427,9 +1423,30 @@ impl<M: InputModeKind> TextElement<M> {
                 }
             });
         }
-        for (display_row, is_folded, icon) in fold_icon_layout.icons.iter_mut() {
-            let is_current_line = current_row == Some(*display_row);
+        for (buffer_line, is_folded, bounds, icon) in fold_icon_layout.icons.iter_mut() {
+            // Arm the toggle even when the chevron is not drawn. Hover-only
+            // painting previously skipped `icon.paint`, so the InteractiveElement
+            // mouse listener never registered and gutter clicks did nothing.
+            let state = self.state.clone();
+            let line = *buffer_line;
+            let hit = *bounds;
+            window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble
+                    || event.button != MouseButton::Left
+                    || !hit.contains(&event.position)
+                {
+                    return;
+                }
+                // Prefer the fold hit over line-number selection / caret placement.
+                cx.stop_propagation();
+                window.prevent_default();
+                state.update(cx, |state, cx| {
+                    state.display_map.toggle_fold(line);
+                    cx.notify();
+                });
+            });
 
+            let is_current_line = current_row == Some(*buffer_line);
             if !is_hovered && !is_current_line && !*is_folded {
                 continue;
             }
