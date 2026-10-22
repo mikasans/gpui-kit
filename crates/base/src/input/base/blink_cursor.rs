@@ -110,10 +110,16 @@ impl BlinkCursor {
             return;
         }
 
+        // Repaint only when the caret was hidden: a keystroke while it already
+        // shows (fast typing, a key held down) changes nothing on screen, and
+        // a notify here repainted the whole window once per key.
+        let was_visible = self.visible;
         self.paused = true;
         self.visible = true;
         self.blinks = 0;
-        cx.notify();
+        if !was_visible {
+            cx.notify();
+        }
 
         // Every pause replaces the pending timer, keeping repeated input visible.
         let epoch = self.next_epoch();
@@ -159,6 +165,27 @@ mod tests {
         assert!(!cursor.read_with(cx, |cursor, _| cursor.visible()));
         cx.executor().advance_clock(INTERVAL);
         cx.run_until_parked();
+        assert!(cursor.read_with(cx, |cursor, _| cursor.visible()));
+    }
+
+    #[gpui::test]
+    fn typing_while_the_cursor_shows_does_not_repaint(cx: &mut TestAppContext) {
+        let cursor = cx.new(|_| BlinkCursor::new());
+        cursor.update(cx, |cursor, cx| cursor.start(cx));
+        cx.run_until_parked();
+        assert!(cursor.read_with(cx, |cursor, _| cursor.visible()));
+        let notifies = Rc::new(Cell::new(0usize));
+        let counter = notifies.clone();
+        let _observer =
+            cx.update(|cx| cx.observe(&cursor, move |_, _| counter.set(counter.get() + 1)));
+        // A burst of keystrokes, each well inside the pause delay.
+        for _ in 0..20 {
+            cursor.update(cx, |cursor, cx| cursor.pause(cx));
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(12));
+            cx.run_until_parked();
+        }
+        assert_eq!(notifies.get(), 0, "each keystroke repainted the caret");
         assert!(cursor.read_with(cx, |cursor, _| cursor.visible()));
     }
 
