@@ -3,6 +3,11 @@ use instant::Duration;
 
 static INTERVAL: Duration = Duration::from_millis(500);
 static PAUSE_DELAY: Duration = Duration::from_millis(300);
+/// Blinks (on/off toggles) after which an idle cursor stops blinking and
+/// stays on, as GTK's `gtk-cursor-blink-timeout` (10 s) does: every blink
+/// repaints the window, which on a software renderer costs real CPU while
+/// nobody is typing. A keystroke, click or refocus starts it blinking again.
+const IDLE_BLINKS: u32 = 20;
 
 // On Windows, Linux, we should use integer to avoid blurry cursor.
 #[cfg(not(target_os = "macos"))]
@@ -20,6 +25,8 @@ pub(crate) struct BlinkCursor {
     visible: bool,
     paused: bool,
     epoch: usize,
+    /// Toggles since the cursor last started or paused.
+    blinks: u32,
 
     _task: Task<()>,
 }
@@ -30,12 +37,14 @@ impl BlinkCursor {
             visible: false,
             paused: false,
             epoch: 0,
+            blinks: 0,
             _task: Task::ready(()),
         }
     }
 
     /// Start the blinking
     pub(crate) fn start(&mut self, cx: &mut Context<Self>) {
+        self.blinks = 0;
         self.blink(self.epoch, cx);
     }
 
@@ -67,6 +76,12 @@ impl BlinkCursor {
 
         self.visible = !self.visible;
         cx.notify();
+        self.blinks = self.blinks.saturating_add(1);
+        if self.visible && self.blinks >= IDLE_BLINKS {
+            // Idle long enough: rest with the cursor on, no timer pending.
+            self._task = Task::ready(());
+            return;
+        }
 
         // Schedule the next blink
         let epoch = self.next_epoch();
@@ -97,6 +112,7 @@ impl BlinkCursor {
 
         self.paused = true;
         self.visible = true;
+        self.blinks = 0;
         cx.notify();
 
         // Every pause replaces the pending timer, keeping repeated input visible.
@@ -144,6 +160,36 @@ mod tests {
         cx.executor().advance_clock(INTERVAL);
         cx.run_until_parked();
         assert!(cursor.read_with(cx, |cursor, _| cursor.visible()));
+    }
+
+    #[gpui::test]
+    fn an_idle_cursor_stops_blinking_visible_until_the_next_keystroke(cx: &mut TestAppContext) {
+        let cursor = cx.new(|_| BlinkCursor::new());
+        cursor.update(cx, |cursor, cx| cursor.start(cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(INTERVAL * (IDLE_BLINKS + 2));
+        cx.run_until_parked();
+        assert!(cursor.read_with(cx, |cursor, _| cursor.visible()));
+
+        let notifies = Rc::new(Cell::new(0usize));
+        let counter = notifies.clone();
+        let _observer =
+            cx.update(|cx| cx.observe(&cursor, move |_, _| counter.set(counter.get() + 1)));
+        cx.executor().advance_clock(INTERVAL * 10);
+        cx.run_until_parked();
+        assert_eq!(notifies.get(), 0, "an idle cursor kept repainting");
+
+        // A keystroke wakes it: after the pause it blinks again.
+        cursor.update(cx, |cursor, cx| cursor.pause(cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(PAUSE_DELAY);
+        cx.run_until_parked();
+        cx.executor().advance_clock(INTERVAL);
+        cx.run_until_parked();
+        assert!(
+            notifies.get() >= 2,
+            "the cursor did not blink after a keystroke"
+        );
     }
 
     #[gpui::test]
