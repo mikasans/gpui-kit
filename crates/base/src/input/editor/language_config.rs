@@ -51,12 +51,16 @@ impl AutoClosingPair {
 /// Language indentation patterns, using Rust's `regex` syntax.
 /// Patterns are compiled by the caller, so invalid expressions are reported at setup.
 /// Applied on Enter: increase matches text before the caret; decrease matches text
-/// after it. This does not reformat existing lines or indentation on paste.
+/// after it, when only whitespace is before the caret (so `f(a,|)` keeps its
+/// indent); outdent-after matches text before the caret whose next line is one
+/// level less (Python's `return`, `pass`). This does not reformat existing
+/// lines or indentation on paste.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct IndentationRules {
     pub increase_indent_pattern: Option<Arc<Regex>>,
     pub decrease_indent_pattern: Option<Arc<Regex>>,
+    pub outdent_after_pattern: Option<Arc<Regex>>,
 }
 
 impl IndentationRules {
@@ -64,7 +68,14 @@ impl IndentationRules {
         Self {
             increase_indent_pattern: Some(Arc::new(increase)),
             decrease_indent_pattern: Some(Arc::new(decrease)),
+            outdent_after_pattern: None,
         }
+    }
+
+    /// The line after one matching `pattern` is one level less indented.
+    pub fn outdent_after(mut self, pattern: Regex) -> Self {
+        self.outdent_after_pattern = Some(Arc::new(pattern));
+        self
     }
 }
 
@@ -163,6 +174,13 @@ impl LanguageConfig {
                 },
                 |r| r.is_match(text),
             )
+    }
+
+    pub(crate) fn outdents_after(&self, text: &str) -> bool {
+        self.indentation_rules
+            .as_ref()
+            .and_then(|r| r.outdent_after_pattern.as_ref())
+            .is_some_and(|r| r.is_match(text))
     }
 
     pub(crate) fn closes_indent(&self, text: &str) -> bool {

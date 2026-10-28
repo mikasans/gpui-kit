@@ -47,9 +47,11 @@ pub(crate) fn init(cx: &mut gpui::App) {
 fn default_language_config(language: &str) -> LanguageConfig {
     static PYTHON_INDENT: LazyLock<IndentationRules> = LazyLock::new(|| {
         IndentationRules::new(
-            Regex::new(r"[\{\(\[:]\s*$").unwrap(),
+            Regex::new(r"[\{\(\[:]\s*(#.*)?$").unwrap(),
             Regex::new(r"^\s*[\}\)\]]").unwrap(),
         )
+        // VS Code's Python rule: a block ends after these statements.
+        .outdent_after(Regex::new(r"^\s*(?:pass|return|raise|break|continue)\b.*$").unwrap())
     });
     match language.to_lowercase().as_str() {
         "text" => LanguageConfig::default()

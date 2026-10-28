@@ -1625,7 +1625,11 @@ impl<M: InputModeKind> InputBaseState<M> {
                     }
                 } else {
                     let line_after = self.text.slice(offset..next_line_start_pos).to_string();
-                    if rules.closes_indent(&line_after) {
+                    // A closer right after the caret dedents only when the
+                    // caret is at the line's indent: `f(a,|)` (an auto-closed
+                    // bracket) keeps the line's indent.
+                    let closes = line_before.trim().is_empty() && rules.closes_indent(&line_after);
+                    if closes || rules.outdents_after(&line_before) {
                         let tab = self.mode.tab_size();
                         if current_indent.ends_with('\t') {
                             current_indent.pop();
@@ -8869,6 +8873,50 @@ mod tests {
             });
         });
         assert_cursors(&mut cx, &view.input, "BEGIN\n  |");
+    }
+
+    #[gpui::test]
+    fn test_python_enter_keeps_indent_before_an_auto_closed_bracket(cx: &mut TestAppContext) {
+        use crate::input::IndentationRules;
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let rules = LanguageConfig::default().indentation_rules(
+            IndentationRules::new(
+                regex::Regex::new(r"[\{\(\[:]\s*(#.*)?$").unwrap(),
+                regex::Regex::new(r"^\s*[\}\)\]]").unwrap(),
+            )
+            .outdent_after(
+                regex::Regex::new(r"^\s*(?:pass|return|raise|break|continue)\b.*$").unwrap(),
+            ),
+        );
+        for (before, expected) in [
+            // An auto-closed `)` after the caret does not dedent the line.
+            ("    print(\"a\",|)", "    print(\"a\",\n    |)"),
+            // At the line's indent, a closer still dedents.
+            ("    |)", "    \n  |)"),
+            // A block ends after return / pass (one level is 2 here).
+            ("    return x|", "    return x\n  |"),
+            ("        pass|", "        pass\n      |"),
+            // `returned` is not `return`.
+            ("    returned = 1|", "    returned = 1\n    |"),
+            ("if x:  # check|", "if x:  # check\n  |"),
+        ] {
+            setup_cursors(&mut cx, &view.input, before);
+            cx.update(|window, cx| {
+                view.input.update(cx, |state, cx| {
+                    crate::input::set_language_config(state.language_name(), rules.clone(), cx);
+                    state.enter(
+                        &Enter {
+                            secondary: false,
+                            shift: false,
+                        },
+                        window,
+                        cx,
+                    );
+                });
+            });
+            assert_cursors(&mut cx, &view.input, expected);
+        }
     }
 
     #[gpui::test]
