@@ -155,6 +155,159 @@ pub(crate) struct TextWrapper {
     _initialized: bool,
 }
 
+/// Lines longer than this wrap by a fast greedy pass (char widths only, a
+/// break after a nearby separator) instead of the line wrapper's full word
+/// segmentation, which took seconds on a 10 MB line; the element also only
+/// shapes the rows on screen of such a line.
+pub(crate) const LONG_LINE_BYTES: usize = 64 * 1024;
+
+/// Per-char advances for [`wrap_long_line`], cached (ASCII in a table).
+struct CharWidths<'a> {
+    cx: &'a App,
+    font_id: gpui::FontId,
+    font_size: Pixels,
+    ascii: [Option<Pixels>; 128],
+    other: std::collections::HashMap<char, Pixels>,
+}
+
+impl<'a> CharWidths<'a> {
+    fn new(cx: &'a App, font: &Font, font_size: Pixels) -> Self {
+        Self {
+            cx,
+            font_id: cx.text_system().resolve_font(font),
+            font_size,
+            ascii: [None; 128],
+            other: Default::default(),
+        }
+    }
+
+    fn width(&mut self, c: char) -> Pixels {
+        let measure = |c| {
+            self.cx
+                .text_system()
+                .advance(self.font_id, self.font_size, c)
+                .map(|size| size.width)
+                .unwrap_or_default()
+        };
+        if (c as u32) < 128 {
+            *self.ascii[c as usize].get_or_insert_with(|| measure(c))
+        } else if let Some(w) = self.other.get(&c) {
+            *w
+        } else {
+            let w = measure(c);
+            self.other.insert(c, w);
+            w
+        }
+    }
+}
+
+/// Greedy wrap of a very long line: a row ends where the next char would
+/// pass `wrap_width`, moved back to just after a separator (space, `,`, `;`,
+/// closing bracket...) when one is within the last 32 bytes.
+pub(crate) fn wrap_long_line(
+    line: &str,
+    wrap_width: Pixels,
+    width_of: &mut impl FnMut(char) -> Pixels,
+) -> Vec<gpui::Boundary> {
+    let mut out = Vec::new();
+    wrap_long_chars(line.chars(), 0, wrap_width, width_of, &mut |ix| {
+        out.push(gpui::Boundary { ix, next_indent: 0 });
+        true
+    });
+    out
+}
+
+/// How far past a row's end the wrap pass looks before it commits to the
+/// break (the separator backtrack plus one char): an edit further on cannot
+/// move that row.
+const LONG_LINE_LOOKAHEAD: usize = 32 + 4;
+
+/// [`wrap_long_line`] over `chars`, the line from byte `from` (a row start)
+/// on, reporting each boundary to `emit` until it returns false. A row's
+/// breaks depend only on the text from its start, which lets an edit re-wrap
+/// from just before it and stop where the rows meet the old ones again.
+fn wrap_long_chars(
+    chars: impl Iterator<Item = char>,
+    from: usize,
+    wrap_width: Pixels,
+    width_of: &mut impl FnMut(char) -> Pixels,
+    emit: &mut impl FnMut(usize) -> bool,
+) {
+    const BACKTRACK: usize = LONG_LINE_LOOKAHEAD - 4;
+    let mut row_start = from;
+    let mut width = px(0.);
+    // Byte index just after the last separator in this row, and the row
+    // width up to there.
+    let mut last_break: Option<(usize, Pixels)> = None;
+    let mut ix = from;
+    for c in chars {
+        let w = width_of(c);
+        if width + w > wrap_width && ix > row_start {
+            let (at, carried) = match last_break {
+                Some((b, bw)) if b > row_start && ix - b <= BACKTRACK => (b, width - bw),
+                _ => (ix, px(0.)),
+            };
+            if !emit(at) {
+                return;
+            }
+            row_start = at;
+            width = carried;
+            last_break = None;
+        }
+        width += w;
+        ix += c.len_utf8();
+        if matches!(
+            c,
+            ' ' | '\t' | ',' | ';' | ':' | '-' | '/' | '}' | ']' | ')' | '>'
+        ) {
+            last_break = Some((ix, width));
+        }
+    }
+}
+
+/// Re-wrap long line `line` (the edited text) after an edit that replaced
+/// `old_edit` (line-relative bytes) with `new_len` bytes: keep the old rows
+/// before the edit, wrap from there, and once a new row starts where an old
+/// one did in the untouched tail, reuse the rest shifted. Typing in a 10 MB
+/// line re-wrapped all of it on every key.
+fn rewrap_long_line(
+    line: &ropey::RopeSlice,
+    old_rows: &[Range<usize>],
+    old_edit: Range<usize>,
+    new_len: usize,
+    wrap_width: Pixels,
+    width_of: &mut impl FnMut(char) -> Pixels,
+) -> SmallVec<[Range<usize>; 1]> {
+    let new_end = old_edit.start + new_len;
+    let keep = old_rows.partition_point(|r| r.end + LONG_LINE_LOOKAHEAD <= old_edit.start);
+    let mut rows: SmallVec<[Range<usize>; 1]> = old_rows[..keep].iter().cloned().collect();
+    let from = rows.last().map_or(0, |r| r.end);
+    let mut prev = from;
+    let mut resumed = false;
+    wrap_long_chars(line.chars_at(from), from, wrap_width, width_of, &mut |b| {
+        rows.push(prev..b);
+        prev = b;
+        if b >= new_end {
+            // The text from `b` on is the old text from `old_b` on.
+            let old_b = b + old_edit.end - new_end;
+            if let Ok(i) = old_rows.binary_search_by(|r| r.start.cmp(&old_b)) {
+                rows.extend(
+                    old_rows[i..]
+                        .iter()
+                        .map(|r| r.start + new_end - old_edit.end..r.end + new_end - old_edit.end),
+                );
+                resumed = true;
+                return false;
+            }
+        }
+        true
+    });
+    if !resumed && (prev < line.len() || prev == 0) {
+        rows.push(prev..line.len());
+    }
+    rows
+}
+
 #[allow(unused)]
 impl TextWrapper {
     pub(crate) fn new(font: Font, font_size: Pixels, wrap_width: Option<Pixels>) -> Self {
@@ -297,11 +450,24 @@ impl TextWrapper {
             .text_system()
             .line_wrapper(self.font.clone(), self.font_size);
         let metrics = self.inline_metrics.clone();
-        self._update(
+        let mut char_widths = CharWidths::new(cx, &self.font, self.font_size);
+        let mut long_widths = CharWidths::new(cx, &self.font, self.font_size);
+        let mut long_width = |c| long_widths.width(c);
+        let no_metrics = metrics.is_empty();
+        self._update_with(
             changed_text,
             range,
             new_text,
             &mut |line_str, wrap_width, line_start| {
+                if line_str.len() > LONG_LINE_BYTES {
+                    let first = metrics.partition_point(|(r, _)| r.end <= line_start);
+                    let has_metrics = metrics
+                        .get(first)
+                        .is_some_and(|(r, _)| r.start < line_start + line_str.len());
+                    if !has_metrics {
+                        return wrap_long_line(line_str, wrap_width, &mut |c| char_widths.width(c));
+                    }
+                }
                 let mut fragments = Vec::new();
                 let mut offset = 0;
                 let first = metrics.partition_point(|(r, _)| r.end <= line_start);
@@ -334,6 +500,7 @@ impl TextWrapper {
                 }
                 line_wrapper.wrap_line(&fragments, wrap_width).collect()
             },
+            no_metrics.then_some(&mut long_width as &mut dyn FnMut(char) -> Pixels),
         );
     }
 
@@ -423,6 +590,22 @@ impl TextWrapper {
     ) where
         F: FnMut(&str, Pixels, usize) -> Vec<gpui::Boundary>,
     {
+        self._update_with(changed_text, range, new_text, wrap_line, None);
+    }
+
+    /// `long_char_width`, when given, wraps lines over [`LONG_LINE_BYTES`]
+    /// with the greedy pass straight from the rope (no copy of the line), and
+    /// an edit inside one such line only re-wraps around the edit.
+    fn _update_with<F>(
+        &mut self,
+        changed_text: &Rope,
+        range: &Range<usize>,
+        new_text: &Rope,
+        wrap_line: &mut F,
+        mut long_char_width: Option<&mut dyn FnMut(char) -> Pixels>,
+    ) where
+        F: FnMut(&str, Pixels, usize) -> Vec<gpui::Boundary>,
+    {
         // Remove the old changed lines.
         let buffer_line_count = self.lines_count();
         let start_row = self.text.offset_to_point(range.start).row;
@@ -445,6 +628,39 @@ impl TextWrapper {
             let mut wrapped_lines = SmallVec::<[Range<usize>; 1]>::new();
             let mut prev_boundary_ix = 0;
             let mut indent_chars = 0;
+
+            let long = line.len() > LONG_LINE_BYTES
+                && self.wrapping_indent == WrappingIndent::Same
+                && wrap_width.is_some();
+            if let (true, Some(width_of), Some(wrap_width)) =
+                (long, long_char_width.as_deref_mut(), wrap_width)
+            {
+                let mut width_of = |c| width_of(c);
+                let single = start_row == end_row && new_start_row == new_end_row;
+                let old_line_start = self.text.line_start_offset(start_row);
+                let old_rows = single
+                    .then(|| self.line(start_row))
+                    .flatten()
+                    .filter(|old| old.len > LONG_LINE_BYTES && old.indent == 0)
+                    .map(|old| &old.wrapped_lines[..]);
+                let wrapped_lines = match old_rows {
+                    Some(old_rows) if range.start >= old_line_start => rewrap_long_line(
+                        &line,
+                        old_rows,
+                        range.start - old_line_start..range.end - old_line_start,
+                        new_text.len(),
+                        wrap_width,
+                        &mut width_of,
+                    ),
+                    _ => rewrap_long_line(&line, &[], 0..0, 0, wrap_width, &mut width_of),
+                };
+                new_lines.push(LineItem {
+                    len: line.len(),
+                    indent: 0,
+                    wrapped_lines,
+                });
+                continue;
+            }
 
             // If wrap_width is Pixels::MAX, skip wrapping to disable word wrap
             if let Some(wrap_width) = wrap_width {
@@ -904,6 +1120,26 @@ impl LineLayout {
         Some(offset + self.wrapped_lines[i].index_for_x(x)?)
     }
 
+    /// Rows of this line inside the window's current clip: a 10 MB wrapped
+    /// line has ~50k rows, a screen shows a few dozen.
+    fn rows_in_view(
+        &self,
+        pos: Point<Pixels>,
+        line_height: Pixels,
+        window: &Window,
+    ) -> Range<usize> {
+        let n = self.wrapped_lines.len();
+        if n <= 64 || line_height <= px(0.) {
+            return 0..n;
+        }
+        let clip = window.content_mask().bounds;
+        let top = ((clip.origin.y - pos.y) / line_height).floor().max(0.) as usize;
+        let bottom = ((clip.origin.y + clip.size.height - pos.y) / line_height)
+            .ceil()
+            .max(0.) as usize;
+        top.min(n)..(bottom + 1).min(n)
+    }
+
     pub(crate) fn size(&self, line_height: Pixels) -> Size<Pixels> {
         let width = self
             .wrapped_lines
@@ -934,7 +1170,14 @@ impl LineLayout {
             return;
         }
 
-        for (ix, line) in self.wrapped_lines.iter().enumerate() {
+        let rows = self.rows_in_view(pos, line_height, window);
+        for (ix, line) in self
+            .wrapped_lines
+            .iter()
+            .enumerate()
+            .take(rows.end)
+            .skip(rows.start)
+        {
             _ = line.paint_background(
                 pos + point(self.line_indent(ix), ix * line_height),
                 line_height,
@@ -955,7 +1198,14 @@ impl LineLayout {
         window: &mut Window,
         cx: &mut App,
     ) {
-        for (ix, line) in self.wrapped_lines.iter().enumerate() {
+        let rows = self.rows_in_view(pos, line_height, window);
+        for (ix, line) in self
+            .wrapped_lines
+            .iter()
+            .enumerate()
+            .take(rows.end)
+            .skip(rows.start)
+        {
             _ = line.paint(
                 pos + point(self.line_indent(ix), ix * line_height),
                 line_height,
@@ -988,6 +1238,81 @@ impl LineLayout {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_long_line_wraps_greedily_preferring_a_nearby_separator() {
+        let line = format!("{}, {}", "a".repeat(15), "b".repeat(30));
+        // 1 px per char, rows of 10 px.
+        let rows = super::wrap_long_line(&line, px(10.), &mut |_| px(1.));
+        let ix: Vec<usize> = rows.iter().map(|b| b.ix).collect();
+        // "aaaaaaaaaa" | "aaaaa, " (break after the separator) | "bbbbbbbbbb" ...
+        assert_eq!(ix, vec![10, 17, 27, 37]);
+        // Every row fits.
+        let mut start = 0;
+        for end in ix.iter().copied().chain([line.len()]) {
+            assert!(end - start <= 10, "{start}..{end}");
+            start = end;
+        }
+        // A wide char is never split.
+        let wide = "é".repeat(30);
+        for b in super::wrap_long_line(&wide, px(10.), &mut |_| px(1.)) {
+            assert!(wide.is_char_boundary(b.ix));
+        }
+    }
+
+    #[test]
+    fn an_edit_in_a_long_line_rewraps_locally_and_matches_a_full_wrap() {
+        let full = |text: &str| {
+            let mut rows = Vec::new();
+            let mut prev = 0;
+            for b in super::wrap_long_line(text, px(40.), &mut width) {
+                rows.push(prev..b.ix);
+                prev = b.ix;
+            }
+            rows.push(prev..text.len());
+            rows
+        };
+        // Wide chars count double, spaces and commas offer breaks.
+        fn width(c: char) -> Pixels {
+            if c.is_ascii() { px(1.) } else { px(2.) }
+        }
+        let mut text: String = (0..4000)
+            .map(|i| match i % 7 {
+                0 => " ",
+                3 => ",",
+                5 => "é",
+                _ => "ab",
+            })
+            .collect();
+        let mut rows = full(&text);
+        // A deterministic mix of inserts and deletes all over the line.
+        let mut seed = 12345u64;
+        for step in 0..300 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let mut at = (seed >> 33) as usize % (text.len() + 1);
+            while !text.is_char_boundary(at) {
+                at -= 1;
+            }
+            let (old_edit, insert) = if step % 3 == 0 {
+                let mut end = (at + (seed as usize % 9)).min(text.len());
+                while !text.is_char_boundary(end) {
+                    end += 1;
+                }
+                (at..end, "")
+            } else {
+                (at..at, ["x", "é", ", ", "longer word "][step % 4])
+            };
+            text.replace_range(old_edit.clone(), insert);
+            let rope = Rope::from(text.as_str());
+            let line = rope.slice(..);
+            let got =
+                super::rewrap_long_line(&line, &rows, old_edit, insert.len(), px(40.), &mut width);
+            rows = got.into_vec();
+            assert_eq!(rows, full(&text), "step {step}");
+        }
+    }
+
     use super::*;
     use std::rc::Rc;
 
@@ -1347,6 +1672,7 @@ mod tests {
             visible_buffer_lines: vec![0],
             visible_line_byte_offsets: vec![0],
             visible_top: px(0.),
+            visible_rows: 0..1,
             visible_range_offset: 0..0,
             lines: Rc::new(vec![]),
             line_height,
@@ -1648,6 +1974,7 @@ mod tests {
             visible_buffer_lines: vec![0],
             visible_line_byte_offsets: vec![0],
             visible_top: px(0.),
+            visible_rows: 0..1,
             visible_range_offset: 0..0,
             lines: Rc::new(vec![]),
             line_height: px(20.0),

@@ -16,6 +16,8 @@ pub(super) struct LastLayout {
     pub(super) visible_buffer_lines: Vec<usize>,
     pub(super) visible_line_byte_offsets: Vec<usize>,
     pub(super) visible_top: Pixels,
+    /// Display rows in the viewport (wrap rows of unfolded lines).
+    pub(super) visible_rows: Range<usize>,
     pub(super) visible_range_offset: Range<usize>,
     pub(super) lines: Rc<Vec<LineLayout>>,
     pub(super) line_height: Pixels,
