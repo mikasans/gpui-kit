@@ -1710,6 +1710,83 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.pause_blink_cursor(cx);
     }
 
+    /// The closer to wrap every selection with when `text` is typed over
+    /// them, if `text` opens a surrounding pair and every selection is
+    /// non-empty.
+    fn auto_surround_closer(&self, text: &str) -> Option<String> {
+        if !self.mode.is_auto_close()
+            || text.chars().count() != 1
+            || self.selections.iter().any(|sel| sel.is_empty())
+        {
+            return None;
+        }
+        const DEFAULT: [(&str, &str); 6] = [
+            ("(", ")"),
+            ("[", "]"),
+            ("{", "}"),
+            ("\"", "\""),
+            ("'", "'"),
+            ("`", "`"),
+        ];
+        let configured = self.mode.language_config().and_then(|rules| {
+            rules
+                .closing_pairs()
+                .find(|(open, _, _)| *open == text)
+                .map(|(_, close, _)| close.to_string())
+        });
+        configured.or_else(|| {
+            DEFAULT
+                .iter()
+                .find(|(open, _)| *open == text)
+                .map(|(_, close)| close.to_string())
+        })
+    }
+
+    fn surround_selections(
+        &mut self,
+        open: &str,
+        close: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selections.merge_overlapping();
+        let before: Vec<CursorSelection> = self.selections.iter().copied().collect();
+        let mut ascending = before.clone();
+        ascending.sort_by_key(|sel| sel.start);
+        let edits: Vec<(Range<usize>, String)> = ascending
+            .iter()
+            .map(|sel| {
+                let inner = self.text.slice(sel.start..sel.end).to_string();
+                (sel.start..sel.end, format!("{open}{inner}{close}"))
+            })
+            .collect();
+        let grow = open.len() + close.len();
+        let after: Vec<CursorSelection> = before
+            .iter()
+            .map(|sel| {
+                let shift = ascending
+                    .iter()
+                    .take_while(|other| other.start < sel.start)
+                    .count()
+                    * grow
+                    + open.len();
+                let mut moved = *sel;
+                moved.start += shift;
+                moved.end += shift;
+                moved.column_anchor = None;
+                moved
+            })
+            .collect();
+        self.undo_manager.begin_transaction_with(EditIntent::Atomic);
+        self.undo_manager.set_pending_intent(EditIntent::Atomic);
+        self.replace_text_in_ranges(&edits, window, cx);
+        self.selections.replace_all(after.clone());
+        self.undo_manager.record_selections(before, after);
+        self.undo_manager.commit_transaction();
+        self.update_preferred_column();
+        cx.notify();
+    }
+
     /// Decide pairing against the pre-edit text, before an opening quote can
     /// change its own syntax context. Ordinary characters never query syntax.
     fn auto_close_target(&self, range: &Range<usize>, text: &str) -> Option<(usize, SharedString)> {
@@ -4128,6 +4205,19 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
                 cx.notify();
                 return;
             }
+        }
+
+        // Auto-surround (VS Code's `editor.autoSurround`): an opening bracket
+        // or quote typed over selections wraps each one instead of replacing
+        // it, keeps the wrapped text selected, and undoes in one step.
+        if range_utf16.is_none()
+            && self.ime_marked_range.is_none()
+            && !self.silent_replace_text
+            && self.is_multi_line()
+            && let Some(close) = self.auto_surround_closer(new_text)
+        {
+            self.surround_selections(new_text, &close, window, cx);
+            return;
         }
 
         if self.is_multi_line() {
@@ -8403,6 +8493,44 @@ mod tests {
             });
         });
         assert_cursors(&mut cx, &view.input, "(x|)");
+    }
+
+    /// Auto-surround: an opener typed over selections wraps each of them,
+    /// keeps the wrapped text selected (so a second opener nests), and one
+    /// undo puts the text and the selections back.
+    #[gpui::test]
+    fn test_auto_surround_wraps_every_selection(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("let s = word and word", window, cx);
+                let selections = [8..12, 17..21]
+                    .into_iter()
+                    .map(|r| CursorSelection::new(state.selections.generate_id(), r.start, r.end))
+                    .collect();
+                state.selections.replace_all(selections);
+                state.replace_text_in_range(None, "(", window, cx);
+                assert_eq!(state.text.to_string(), "let s = (word) and (word)");
+                assert_eq!(state.selection_ranges(), vec![9..13, 20..24]);
+                state.replace_text_in_range(None, "\"", window, cx);
+                assert_eq!(state.text.to_string(), "let s = (\"word\") and (\"word\")");
+                assert_eq!(state.selection_ranges(), vec![10..14, 23..27]);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.text.to_string(), "let s = (word) and (word)");
+                assert_eq!(state.selection_ranges(), vec![9..13, 20..24]);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.text.to_string(), "let s = word and word");
+                // A non-opener still replaces the selection.
+                let id = state.selections.generate_id();
+                state
+                    .selections
+                    .replace_all(vec![CursorSelection::new(id, 8, 12)]);
+                state.replace_text_in_range(None, "x", window, cx);
+                assert_eq!(state.text.to_string(), "let s = x and word");
+            });
+        });
     }
 
     #[gpui::test]
