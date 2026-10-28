@@ -31,7 +31,9 @@ actions!(
         /// Find: toggle Match Whole Word (ab).
         ToggleSearchWholeWord,
         /// Find: toggle Use Regular Expression (.*).
-        ToggleSearchRegex
+        ToggleSearchRegex,
+        /// Find: replace every match (VS Code's Ctrl+Alt+Enter).
+        ReplaceAllMatches
     ]
 );
 
@@ -50,6 +52,10 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("alt-w", ToggleSearchWholeWord, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("alt-r", ToggleSearchRegex, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-enter", ReplaceAllMatches, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-alt-enter", ReplaceAllMatches, Some(CONTEXT)),
     ]);
 }
 
@@ -262,6 +268,18 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
     }
 
     fn on_action_enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        // Enter in the Replace field replaces the current match (VS Code).
+        if self.session.replace_mode
+            && !action.shift
+            && self
+                .replace_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
+            self.replace_next(window, cx);
+            return;
+        }
         if action.shift {
             self.prev(window, cx);
         } else {
@@ -413,6 +431,9 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                 cx.listener(|this, _: &ToggleSearchWholeWord, _, cx| this.toggle_whole_word(cx)),
             )
             .on_action(cx.listener(|this, _: &ToggleSearchRegex, _, cx| this.toggle_regex(cx)))
+            .on_action(
+                cx.listener(|this, _: &ReplaceAllMatches, window, cx| this.replace_all(window, cx)),
+            )
             .font_family(cx.theme().font_family.clone())
             .items_center()
             .py_2()

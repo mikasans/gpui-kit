@@ -13,7 +13,9 @@ mod otp_input;
 mod overlay;
 pub(crate) mod popovers;
 mod search;
-pub use search::{ToggleSearchCaseSensitive, ToggleSearchRegex, ToggleSearchWholeWord};
+pub use search::{
+    ReplaceAllMatches, ToggleSearchCaseSensitive, ToggleSearchRegex, ToggleSearchWholeWord,
+};
 mod syntax_context;
 
 pub(crate) use clear_button::*;
