@@ -3027,24 +3027,45 @@ impl<M: InputModeKind> Element for TextElement<M> {
             window.paint_path(path.clone(), *color);
         }
 
-        // Paint selections
-        if window.is_window_active() {
+        // Search matches show whether or not the window is active (the find
+        // field has the keyboard, or another window does): every match gets
+        // a faint fill, the current one a strong one of its own.
+        {
             let secondary_selection = Hsla {
                 s: 0.1,
                 ..editor_style.selection
             };
+            let current_match = Hsla {
+                a: editor_style.selection.a.max(0.55),
+                ..editor_style.selection
+            };
             for (path, is_active) in prepaint.search_match_paths.iter() {
-                window.paint_path(path.clone(), secondary_selection);
-
-                if *is_active {
-                    window.paint_path(path.clone(), editor_style.selection);
-                }
+                let fill = if *is_active {
+                    current_match
+                } else {
+                    secondary_selection
+                };
+                window.paint_path(path.clone(), fill);
             }
+        }
 
-            for path in prepaint.selection_paths.drain(..) {
-                window.paint_path(path, editor_style.selection);
-            }
-
+        // Paint selections. An inactive window keeps showing them, dimmed
+        // (like VS Code's inactive selection), so leaving the app or closing
+        // Find never hides where the selection is.
+        let window_active = window.is_window_active();
+        let selection = if window_active {
+            editor_style.selection
+        } else {
+            editor_style.selection.opacity(0.6)
+        };
+        for path in prepaint.selection_paths.drain(..) {
+            window.paint_path(path, selection);
+        }
+        if window_active {
+            let secondary_selection = Hsla {
+                s: 0.1,
+                ..editor_style.selection
+            };
             // Paint hover highlight
             if let Some(path) = prepaint.hover_highlight_path.take() {
                 window.paint_path(path, secondary_selection);

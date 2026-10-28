@@ -441,8 +441,11 @@ fn search_keyboard_navigation_wraps_and_escape_returns_editor_focus(cx: &mut Tes
             window.find(("input", state.entity_id())).focused(),
             Some(true)
         );
+        // Navigation selected the current match (as in VS Code), and the
+        // selection survives closing Find: typing replaces that match.
+        assert_eq!(state.read(cx).selected_range(), 8..11);
         window.input("!", cx);
-        assert_eq!(state.read(cx).value(), "!one two one");
+        assert_eq!(state.read(cx).value(), "one two !");
     })
     .unwrap();
 }

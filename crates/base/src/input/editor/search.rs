@@ -319,6 +319,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     pub fn next_search_match(&mut self, cx: &mut Context<Self>) -> Option<Range<usize>> {
         self.sync_search_matcher();
         let range = self.search_session.matcher.next()?;
+        self.select_search_match(&range, cx);
         // Match order does not describe viewport direction after a manual
         // scroll. Always allow search navigation to reveal the active match.
         self.scroll_to_with_padding(range.end, None, ScrollPadding::SurroundingLines, cx);
@@ -328,10 +329,17 @@ impl<M: InputModeKind> InputBaseState<M> {
     pub fn previous_search_match(&mut self, cx: &mut Context<Self>) -> Option<Range<usize>> {
         self.sync_search_matcher();
         let range = self.search_session.matcher.next_back()?;
+        self.select_search_match(&range, cx);
         // Match order does not describe viewport direction after a manual
         // scroll. Always allow search navigation to reveal the active match.
         self.scroll_to_with_padding(range.start, None, ScrollPadding::SurroundingLines, cx);
         Some(range)
+    }
+
+    /// Navigating matches selects the current one (as VS Code does): the
+    /// caret and status follow it, and closing Find leaves it selected.
+    fn select_search_match(&mut self, range: &Range<usize>, cx: &mut Context<Self>) {
+        self.set_selected_range(range.clone(), cx);
     }
 
     /// Replace the current match and move on to the next one. Returns whether
