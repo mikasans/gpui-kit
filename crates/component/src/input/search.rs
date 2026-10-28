@@ -385,6 +385,23 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
     }
 }
 
+/// VS Code's input option toggles (Aa / ab / .*): on, a tinted fill and a
+/// 1px accent border; off, the same border transparent, so the size does not
+/// change. The border alone is well over 3:1 against the panel either way.
+pub fn option_toggle_style(button: Button, on: bool, cx: &App) -> Button {
+    let accent = cx.theme().primary;
+    button.border_1().map(|button| {
+        if on {
+            button
+                .bg(accent.opacity(0.18))
+                .border_color(accent)
+                .text_color(cx.theme().foreground)
+        } else {
+            button.border_color(gpui::transparent_black())
+        }
+    })
+}
+
 impl<M: crate::input::overlay::OverlayMode> Focusable for SearchPanel<M> {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.search_input.read(cx).focus_handle(cx)
@@ -400,14 +417,18 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
         let has_matches = !self.session.matcher.is_empty();
         let error = self.session.matcher.error().map(|e| e.to_string());
         let toggle = |id: &'static str, label: &'static str, on: bool, tip: &'static str| {
-            Button::new(id)
-                .selected(on)
-                .toggled(on)
-                .xsmall()
-                .compact()
-                .text()
-                .label(label)
-                .tooltip(tip)
+            option_toggle_style(
+                Button::new(id)
+                    .selected(on)
+                    .toggled(on)
+                    .xsmall()
+                    .compact()
+                    .text()
+                    .label(label)
+                    .tooltip(tip),
+                on,
+                cx,
+            )
         };
         let allow_replace = self.replaceable(cx);
         if !allow_replace {
@@ -463,17 +484,21 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                                         h_flex()
                                             .gap_0p5()
                                             .child(
-                                                Button::new("case-insensitive")
-                                                    .selected(!self.session.case_insensitive)
-                                                    .toggled(!self.session.case_insensitive)
-                                                    .xsmall()
-                                                    .compact()
-                                                    .text()
-                                                    .icon(IconName::CaseSensitive)
-                                                    .tooltip("Match Case (Alt+C)")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.toggle_case_sensitive(cx);
-                                                    })),
+                                                option_toggle_style(
+                                                    Button::new("case-insensitive")
+                                                        .selected(!self.session.case_insensitive)
+                                                        .toggled(!self.session.case_insensitive)
+                                                        .xsmall()
+                                                        .compact()
+                                                        .text()
+                                                        .icon(IconName::CaseSensitive)
+                                                        .tooltip("Match Case (Alt+C)"),
+                                                    !self.session.case_insensitive,
+                                                    cx,
+                                                )
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.toggle_case_sensitive(cx);
+                                                })),
                                             )
                                             .child(
                                                 toggle(

@@ -15,6 +15,7 @@ pub(crate) mod popovers;
 mod search;
 pub use search::{
     ReplaceAllMatches, ToggleSearchCaseSensitive, ToggleSearchRegex, ToggleSearchWholeWord,
+    option_toggle_style,
 };
 mod syntax_context;
 
