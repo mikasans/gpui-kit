@@ -352,6 +352,10 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) text: Rope,
     pub(super) display_map: DisplayMap,
     pub(super) undo_manager: UndoManager,
+    /// The newest selection of a Ctrl+D run that began at a bare caret
+    /// (its id and range): while it is still the newest selection, Ctrl+D
+    /// matches whole words, case-sensitively (VS Code).
+    pub(super) next_match_word: Option<(super::selection::CursorId, Range<usize>)>,
     pub(super) inline_tokens: Option<Box<super::inline_tokens::InlineTokenStore>>,
     pub(super) pending_token: Option<super::InlineToken>,
     pub(super) replaying_history: bool,
@@ -718,6 +722,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             cursor_surrounding_lines: None,
             blink_cursor,
             undo_manager,
+            next_match_word: None,
             inline_tokens: None,
             pending_token: None,
             replaying_history: false,
@@ -2258,6 +2263,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             active.end = word.end;
             active.reversed = false;
             active.column_anchor = None;
+            self.next_match_word = Some((active.id, word.clone()));
             cx.notify();
             return true;
         }
@@ -2265,29 +2271,56 @@ impl<M: InputModeKind> InputBaseState<M> {
             return false;
         }
         let needle = self.text.slice(newest.start..newest.end).to_string();
-        let text = self.text.to_string();
+        // Started at a bare caret: whole words, matching case. Otherwise the
+        // selected text, anywhere, matching case (VS Code's default).
+        let word = self
+            .next_match_word
+            .as_ref()
+            .is_some_and(|(id, range)| *id == newest.id && *range == (newest.start..newest.end));
+        let Ok(Some(query)) = super::search::SearchQuery::new(
+            &needle,
+            super::search::SearchOptions {
+                case_sensitive: true,
+                whole_word: word,
+                regex: false,
+            },
+        ) else {
+            return false;
+        };
         let taken = |start: usize, end: usize, selections: &Selections| {
             selections
                 .iter()
                 .any(|sel| start < sel.end.max(sel.start + 1) && sel.start < end.max(start + 1))
         };
-        // From the end of the newest selection to the end, then from the top.
-        let after = text[newest.end..]
-            .match_indices(needle.as_str())
-            .map(|(ix, _)| newest.end + ix);
-        let before = text[..newest.start]
-            .match_indices(needle.as_str())
-            .map(|(ix, _)| ix);
-        let Some(start) = after
-            .chain(before)
-            .find(|&start| !taken(start, start + needle.len(), &self.selections))
-        else {
+        // From the end of the newest selection to the end, then from the
+        // top; the rope is read in bounded batches, never copied whole.
+        let len = self.text.len();
+        let next_in = |from: usize, to: usize| -> Option<usize> {
+            const BATCH: usize = 256 << 10;
+            let mut at = from;
+            while at < to {
+                let batch_end = (at + BATCH).min(to);
+                let (found, next) = super::search::find_in_range(&self.text, &query, at, batch_end);
+                if let Some(range) = found
+                    .into_iter()
+                    .find(|range| !taken(range.start, range.end, &self.selections))
+                {
+                    return Some(range.start);
+                }
+                at = next.max(batch_end);
+            }
+            None
+        };
+        let Some(start) = next_in(newest.end, len).or_else(|| next_in(0, newest.start)) else {
             return false;
         };
         let end = start + needle.len();
         self.undo_manager.break_transaction_coalescing();
         let id = self.selections.generate_id();
         self.selections.add(CursorSelection::new(id, start, end));
+        if word {
+            self.next_match_word = Some((id, start..end));
+        }
         self.scroll_to(end, None, cx);
         cx.notify();
         true
@@ -9389,6 +9422,45 @@ mod tests {
                 assert_eq!(state.text.to_string().trim_end(), "abc world");
                 state.undo(&Undo, window, cx);
                 assert_eq!(state.text.to_string().trim_end(), "hello world");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_ctrl_d_from_a_caret_matches_whole_words_and_case(cx: &mut TestAppContext) {
+        let view = multi_line(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+
+        setup_cursors(&mut cx, &input, "val|ue value_2 Value value");
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                assert!(state.add_selection_to_next_find_match(cx));
+                assert!(state.add_selection_to_next_find_match(cx));
+                // Not `value` inside `value_2`, not `Value`.
+                assert_eq!(state.selection_ranges(), vec![0..5, 20..25]);
+                assert!(!state.add_selection_to_next_find_match(cx));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_ctrl_d_from_a_selection_matches_the_text_anywhere(cx: &mut TestAppContext) {
+        let view = multi_line(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+
+        setup_cursors(&mut cx, &input, "value value_2 Value|");
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                let id = state.selections.generate_id();
+                state
+                    .selections
+                    .replace_all(vec![CursorSelection::new(id, 0, 5)]);
+                assert!(state.add_selection_to_next_find_match(cx));
+                // A selection the user made matches inside words too, with case.
+                assert_eq!(state.selection_ranges(), vec![0..5, 6..11]);
+                assert!(!state.add_selection_to_next_find_match(cx));
             });
         });
     }
