@@ -2228,6 +2228,83 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx.notify();
     }
 
+    /// VS Code's Ctrl+D (Add Selection to Next Find Match): with an empty
+    /// selection, select the word at the caret; otherwise add a selection
+    /// on the next occurrence of the newest selection's text after it
+    /// (wrapping around, skipping text that is already selected), and
+    /// scroll there. Typing then edits every selection at once, as one undo
+    /// step. Returns whether a selection was made or added.
+    pub fn add_selection_to_next_find_match(&mut self, cx: &mut Context<Self>) -> bool {
+        let newest = *self
+            .selections
+            .iter()
+            .max_by_key(|sel| sel.id)
+            .expect("Selections always has at least one selection");
+        if newest.is_empty() {
+            if !self.selections.is_single() {
+                return false;
+            }
+            let at = newest.cursor_offset();
+            let Some(word) = self
+                .text
+                .word_range(at)
+                .or_else(|| at.checked_sub(1).and_then(|at| self.text.word_range(at)))
+            else {
+                return false;
+            };
+            self.undo_manager.break_transaction_coalescing();
+            let active = self.selections.active_mut();
+            active.start = word.start;
+            active.end = word.end;
+            active.reversed = false;
+            active.column_anchor = None;
+            cx.notify();
+            return true;
+        }
+        if !self.is_multi_line() {
+            return false;
+        }
+        let needle = self.text.slice(newest.start..newest.end).to_string();
+        let text = self.text.to_string();
+        let taken = |start: usize, end: usize, selections: &Selections| {
+            selections
+                .iter()
+                .any(|sel| start < sel.end.max(sel.start + 1) && sel.start < end.max(start + 1))
+        };
+        // From the end of the newest selection to the end, then from the top.
+        let after = text[newest.end..]
+            .match_indices(needle.as_str())
+            .map(|(ix, _)| newest.end + ix);
+        let before = text[..newest.start]
+            .match_indices(needle.as_str())
+            .map(|(ix, _)| ix);
+        let Some(start) = after
+            .chain(before)
+            .find(|&start| !taken(start, start + needle.len(), &self.selections))
+        else {
+            return false;
+        };
+        let end = start + needle.len();
+        self.undo_manager.break_transaction_coalescing();
+        let id = self.selections.generate_id();
+        self.selections.add(CursorSelection::new(id, start, end));
+        self.scroll_to(end, None, cx);
+        cx.notify();
+        true
+    }
+
+    /// How many selections (cursors) the input has; at least one.
+    pub fn selection_count(&self) -> usize {
+        self.selections.len()
+    }
+
+    /// Every selection's range, in the order they were made.
+    pub fn selection_ranges(&self) -> Vec<Range<usize>> {
+        let mut selections: Vec<_> = self.selections.iter().collect();
+        selections.sort_by_key(|sel| sel.id);
+        selections.iter().map(|sel| sel.start..sel.end).collect()
+    }
+
     /// Build a columnar (block) selection spanning the rows between the two
     /// points, one selection per display row at the same column span.
     ///
@@ -9258,6 +9335,56 @@ mod tests {
                 // A distinct offset adds a cursor.
                 state.add_cursor_at(4, cx);
                 assert_eq!(state.selections.len(), 2);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_ctrl_d_adds_the_next_match_and_typing_edits_all_in_one_undo(cx: &mut TestAppContext) {
+        let view = multi_line(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+
+        setup_cursors(&mut cx, &input, "fo|o bar foo\nfoo");
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                // First: the word at the caret.
+                assert!(state.add_selection_to_next_find_match(cx));
+                assert_eq!(state.selection_ranges(), vec![0..3]);
+                assert!(state.add_selection_to_next_find_match(cx));
+                assert!(state.add_selection_to_next_find_match(cx));
+                assert_eq!(state.selection_ranges(), vec![0..3, 8..11, 12..15]);
+                // Every occurrence is taken: nothing more to add.
+                assert!(!state.add_selection_to_next_find_match(cx));
+                assert_eq!(state.selection_count(), 3);
+                state.replace_text_in_range(None, "x", window, cx);
+            });
+        });
+        assert_cursors(&mut cx, &input, "x| bar x|\nx|");
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| state.undo(&Undo, window, cx));
+        });
+        // One undo step brings every occurrence back, and its selection.
+        assert_cursors(&mut cx, &input, "foo| bar foo|\nfoo|");
+        // Escape goes back to one cursor.
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| state.escape(&Escape, window, cx));
+        });
+        input.read_with(&cx, |state, _| assert_eq!(state.selection_count(), 1));
+    }
+
+    #[gpui::test]
+    fn test_ctrl_d_wraps_around_to_the_top(cx: &mut TestAppContext) {
+        let view = multi_line(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+
+        setup_cursors(&mut cx, &input, "ab ab a|b");
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                assert!(state.add_selection_to_next_find_match(cx));
+                assert!(state.add_selection_to_next_find_match(cx));
+                assert_eq!(state.selection_ranges(), vec![6..8, 0..2]);
             });
         });
     }
