@@ -338,7 +338,9 @@ impl RopeExt for Rope {
         let point = self.offset_to_point(offset);
         let line = self.slice_line(point.row);
         let offset = line.utf16_to_byte_idx(line.byte_to_utf16_idx(point.column));
-        let character = line.slice(..offset).chars().count();
+        // O(log n): counting chars took as long as the line (seconds per
+        // frame for a caret deep in a 10 MB line).
+        let character = line.byte_to_char_idx(offset);
         Position::new(point.row as u32, character as u32)
     }
 
@@ -438,12 +440,12 @@ impl RopeExt for Rope {
     }
 
     fn char_index_to_offset(&self, char_offset: usize) -> usize {
-        self.chars().take(char_offset).map(|c| c.len_utf8()).sum()
+        self.char_to_byte_idx(char_offset.min(self.len_chars()))
     }
 
     fn offset_to_char_index(&self, offset: usize) -> usize {
         let offset = self.clip_offset(offset, Bias::Right);
-        self.slice(..offset).chars().count()
+        self.byte_to_char_idx(offset)
     }
 }
 
@@ -715,5 +717,24 @@ mod tests {
         assert_eq!(rope.offset_to_char_index(5), 3);
         assert_eq!(rope.offset_to_char_index(6), 4);
         assert_eq!(rope.offset_to_char_index(10), 5);
+    }
+
+    #[test]
+    fn positions_deep_in_a_long_line_are_cheap_and_exact() {
+        let line = "ab中🎉".repeat(500_000); // 4.5 MB, one line
+        let rope = Rope::from(format!("x\n{line}"));
+        let start = std::time::Instant::now();
+        let offset = rope.len() - "🎉".len();
+        for _ in 0..1_000 {
+            assert_eq!(
+                rope.offset_to_position(offset),
+                Position::new(1, 4 * 500_000 - 1)
+            );
+        }
+        assert_eq!(rope.offset_to_char_index(offset), 2 + 4 * 500_000 - 1);
+        assert_eq!(rope.char_index_to_offset(2 + 4 * 500_000 - 1), offset);
+        assert_eq!(rope.char_index_to_offset(usize::MAX), rope.len());
+        // Counting chars from the line start took milliseconds per call.
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
     }
 }
