@@ -370,6 +370,11 @@ pub struct InputBaseState<M: InputModeKind> {
     /// The background scan of a big document's search (see
     /// `ASYNC_SEARCH_BYTES`); dropping it cancels it.
     pub(super) search_task: Option<gpui::Task<()>>,
+    /// Find as you type in a big document found nothing yet because the
+    /// background scan had not reached a match: the selection then, so the
+    /// scan reveals the first match when it finds one (unless the selection
+    /// moved meanwhile).
+    pub(super) search_reveal_pending: Option<std::ops::Range<usize>>,
     /// Advances every time search is explicitly invoked. See
     /// [`InputBaseState::search_activation_revision`].
     pub(super) search_activation_revision: u64,
@@ -713,6 +718,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             display_map: DisplayMap::new(text_style.font(), window.rem_size(), None),
             search_session: super::SearchSession::default(),
             search_task: None,
+            search_reveal_pending: None,
             search_activation_revision: 0,
             searchable: false,
             replaceable: true,
@@ -5818,6 +5824,35 @@ mod tests {
         });
         input.read_with(&cx, |state, _| {
             assert!(!state.search_session().is_active());
+        });
+    }
+
+    /// Find as you type in a big document: the only match is past the quick
+    /// scan, so it is found by the background scan, which must then select
+    /// it (the editor follows the query, as VS Code does).
+    #[gpui::test]
+    fn test_find_as_you_type_reveals_a_match_the_background_scan_finds(cx: &mut TestAppContext) {
+        let input_view = InputView::build_editor(cx, |state| state.searchable(false));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let filler = "let value = foo(a, b); // padding padding\n".repeat(60_000);
+        let text = format!("{filler}needle here\n");
+        let at = filler.len();
+        assert!(text.len() > crate::input::ASYNC_SEARCH_BYTES);
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(text.clone(), window, cx);
+                state.set_selected_range(0..0, cx);
+                state.set_search_query("needle", false, cx);
+                assert_eq!(state.reveal_search_match_from_selection(cx), None);
+            });
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        input.read_with(&cx, |state, _| {
+            assert!(!state.search_session().matcher.is_pending());
+            assert_eq!(state.selected_range(), at..at + "needle".len());
         });
     }
 

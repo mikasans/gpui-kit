@@ -342,6 +342,10 @@ impl<M: InputModeKind> InputBaseState<M> {
                             .matcher
                             .apply_batch(generation, found, next, done);
                         if applied {
+                            if state.search_reveal_pending.as_ref() == Some(&state.selected_range())
+                            {
+                                _ = state.reveal_search_match_from_selection(cx);
+                            }
                             cx.notify();
                         }
                         applied
@@ -358,11 +362,13 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// End the search: hide the built-in panel and the match highlights. The
     /// query is kept so the next [`InputBaseState::open_search`] resumes it.
     pub fn close_search(&mut self, cx: &mut Context<Self>) {
+        self.search_reveal_pending = None;
         self.search_session.close();
         cx.notify();
     }
 
     pub fn next_search_match(&mut self, cx: &mut Context<Self>) -> Option<Range<usize>> {
+        self.search_reveal_pending = None;
         self.sync_search_matcher();
         let range = self.search_session.matcher.next()?;
         self.select_search_match(&range, cx);
@@ -373,6 +379,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub fn previous_search_match(&mut self, cx: &mut Context<Self>) -> Option<Range<usize>> {
+        self.search_reveal_pending = None;
         self.sync_search_matcher();
         let range = self.search_session.matcher.next_back()?;
         self.select_search_match(&range, cx);
@@ -390,14 +397,17 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
         self.sync_search_matcher();
+        self.search_reveal_pending = None;
         let from = self.selected_range().start;
         let matcher = &mut self.search_session.matcher;
-        if matcher.is_empty() {
-            return None;
-        }
         let ix = matcher.matched_ranges().partition_point(|r| r.start < from);
         if ix >= matcher.len() && matcher.is_pending() {
-            // Past what a big document's scan has found so far.
+            // Past what a big document's scan has found so far: reveal the
+            // match when the scan gets there.
+            self.search_reveal_pending = Some(self.selected_range());
+            return None;
+        }
+        if matcher.is_empty() {
             return None;
         }
         matcher.set_current_match_index(if ix >= matcher.len() { 0 } else { ix });
