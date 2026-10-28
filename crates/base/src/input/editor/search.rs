@@ -2,11 +2,25 @@ use crate::input::InputModeKind;
 use aho_corasick::AhoCorasick;
 use gpui::{Context, Window};
 use ropey::Rope;
-use std::{ops::Range, rc::Rc};
+use std::{ops::Range, rc::Rc, time::Duration};
+use sum_tree::Bias;
 
 use super::{
     InputBaseState, Replace, RopeExt as _, Search, movement::MoveDirection, state::ScrollPadding,
 };
+
+/// Documents larger than this (bytes) are searched off the UI thread: the
+/// matches on screen come first, the rest arrive in batches after a short
+/// debounce, and the count reads `≥N` until the scan is done. Smaller ones
+/// are searched in place, as before.
+pub const ASYNC_SEARCH_BYTES: usize = 1 << 20;
+/// Typing pauses this long before a big document is scanned.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
+/// Bytes scanned per background batch.
+const SEARCH_BATCH_BYTES: usize = 4 << 20;
+/// At most this much around the viewport is scanned at once, on the UI
+/// thread (a 10 MB single line is all "visible").
+const QUICK_SCAN_BYTES: usize = 256 << 10;
 
 /// Stateful, presentation-independent search engine used by text inputs.
 #[derive(Debug, Clone)]
@@ -16,6 +30,43 @@ pub struct SearchMatcher {
     matched_ranges: Rc<Vec<Range<usize>>>,
     current_match_ix: usize,
     replacing: bool,
+    /// A background scan is running; `matched_ranges` holds what it found
+    /// so far plus the on-screen matches beyond it.
+    pending: bool,
+    /// Bumped by every new scan; batches of an older one are dropped.
+    generation: u64,
+    /// Matches of the running scan, in order, and how far it has got.
+    scanned: Vec<Range<usize>>,
+    scanned_to: usize,
+    /// On-screen matches found before the scan reaches them.
+    quick: Vec<Range<usize>>,
+}
+
+/// Matches of `query` that start in `from..to` (clipped to char
+/// boundaries), and where the next batch should start: at `to`, or past a
+/// match that runs over it, so batches together find what one scan would.
+pub fn find_in_range(
+    text: &Rope,
+    query: &AhoCorasick,
+    from: usize,
+    to: usize,
+) -> (Vec<Range<usize>>, usize) {
+    let len = text.len();
+    let from = text.clip_offset(from.min(len), Bias::Left);
+    let to = text.clip_offset(to.min(len), Bias::Right).max(from);
+    let end = text.clip_offset((to + query.max_pattern_len()).min(len), Bias::Right);
+    let haystack = text.slice(from..end).to_string();
+    let mut found = Vec::new();
+    let mut next = to;
+    for m in query.find_iter(haystack.as_bytes()) {
+        let range = from + m.start()..from + m.end();
+        if range.start >= to {
+            break;
+        }
+        next = next.max(range.end);
+        found.push(range);
+    }
+    (found, next)
 }
 
 /// One search over an input: the query, how the built-in panel shows it, and
@@ -126,6 +177,14 @@ impl<M: InputModeKind> InputBaseState<M> {
         };
         let case_insensitive = self.search_session.case_insensitive;
         self.search_session.update_query(query, case_insensitive);
+        if SearchMatcher::is_async_for(&self.text) {
+            if query_changed || self.search_session.matcher.text.len() != self.text.len() {
+                let anchor = self.search_session.anchor_offset;
+                self.schedule_search(anchor, cx);
+            }
+            cx.notify();
+            return;
+        }
         self.search_session.matcher.update(&self.text);
         if query_changed && let Some(anchor) = self.search_session.anchor_offset {
             self.search_session.matcher.update_cursor_by_offset(anchor);
@@ -176,9 +235,78 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         self.search_session.activate();
+        let query = query.into();
+        let changed = query != self.search_session.query
+            || case_insensitive != self.search_session.case_insensitive;
         self.search_session.update_query(query, case_insensitive);
+        if SearchMatcher::is_async_for(&self.text) {
+            if changed || self.search_session.matcher.text.len() != self.text.len() {
+                let anchor = self
+                    .last_layout
+                    .as_ref()
+                    .map(|layout| layout.visible_range_offset.start);
+                self.schedule_search(anchor, cx);
+            }
+            cx.notify();
+            return;
+        }
         self.search_session.matcher.update(&self.text);
         cx.notify();
+    }
+
+    /// Search a big document without blocking: the matches around the
+    /// viewport are found now, the whole document in background batches
+    /// after [`SEARCH_DEBOUNCE`]. A newer call (the next keystroke, an
+    /// edit) drops this one's task and ignores its late batches.
+    fn schedule_search(&mut self, anchor: Option<usize>, cx: &mut Context<Self>) {
+        let text = self.text.clone();
+        let generation = self.search_session.matcher.begin_async(&text);
+        let Some(query) = self.search_session.matcher.query.clone() else {
+            self.search_task = None;
+            return;
+        };
+        let visible = self
+            .last_layout
+            .as_ref()
+            .map(|layout| layout.visible_range_offset.clone())
+            .unwrap_or(0..0);
+        let quick_from = anchor.unwrap_or(visible.start).min(visible.start);
+        let quick_to = visible
+            .end
+            .max(quick_from)
+            .min(quick_from + QUICK_SCAN_BYTES);
+        let (quick, _) = find_in_range(&text, &query, quick_from, quick_to);
+        self.search_session.matcher.set_quick(quick, anchor);
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+            let len = text.len();
+            let mut from = 0;
+            loop {
+                let to = (from + SEARCH_BATCH_BYTES).min(len);
+                let (batch_text, batch_query) = (text.clone(), query.clone());
+                let (found, next) = cx
+                    .background_executor()
+                    .spawn(async move { find_in_range(&batch_text, &batch_query, from, to) })
+                    .await;
+                let done = next >= len;
+                let applied = this
+                    .update(cx, |state, cx| {
+                        let applied = state
+                            .search_session
+                            .matcher
+                            .apply_batch(generation, found, next, done);
+                        if applied {
+                            cx.notify();
+                        }
+                        applied
+                    })
+                    .unwrap_or(false);
+                if !applied || done {
+                    break;
+                }
+                from = next;
+            }
+        }));
     }
 
     /// End the search: hide the built-in panel and the match highlights. The
@@ -251,6 +379,17 @@ impl<M: InputModeKind> InputBaseState<M> {
             return 0;
         }
         self.sync_search_matcher();
+        if self.search_session.matcher.is_pending() {
+            // Replace All needs every match: finish the scan now.
+            let generation = self.search_session.matcher.begin_async(&self.text);
+            if let Some(query) = self.search_session.matcher.query.clone() {
+                let (found, _) = find_in_range(&self.text, &query, 0, self.text.len());
+                self.search_session
+                    .matcher
+                    .apply_batch(generation, found, self.text.len(), true);
+            }
+            self.search_task = None;
+        }
         let ranges = self.search_session.matcher.matched_ranges();
         if ranges.is_empty() {
             return 0;
@@ -269,15 +408,32 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Keep the matches in step with an edit. A closed search skips the scan:
     /// it copies and searches the whole document, and nothing reads the
     /// matches until the search is resumed or navigated, which sync first.
-    pub(super) fn update_search(&mut self, _cx: &mut gpui::App) {
+    pub(super) fn update_search(&mut self, cx: &mut Context<Self>) {
         if !self.search_session.is_active() {
+            return;
+        }
+        if SearchMatcher::is_async_for(&self.text) {
+            // The text changed: rescan in the background, keeping the
+            // current match near where it was.
+            let keep = self
+                .search_session
+                .matcher
+                .matched_ranges()
+                .get(self.search_session.matcher.current_match_index())
+                .map(|range| range.start);
+            self.schedule_search(keep, cx);
             return;
         }
         self.sync_search_matcher();
     }
 
-    /// Recompute the matches if the text changed since the last scan.
+    /// Recompute the matches if the text changed since the last scan. A big
+    /// document is rescanned by [`Self::update_search`] after each edit;
+    /// comparing it here would read the whole text on every navigation.
     fn sync_search_matcher(&mut self) {
+        if SearchMatcher::is_async_for(&self.text) {
+            return;
+        }
         self.search_session.matcher.update(&self.text);
     }
 
@@ -319,7 +475,87 @@ impl SearchMatcher {
             matched_ranges: Rc::new(Vec::new()),
             current_match_ix: 0,
             replacing: false,
+            pending: false,
+            generation: 0,
+            scanned: Vec::new(),
+            scanned_to: 0,
+            quick: Vec::new(),
         }
+    }
+
+    /// Whether `text` is searched in the background (see
+    /// [`ASYNC_SEARCH_BYTES`]).
+    pub fn is_async_for(text: &Rope) -> bool {
+        text.len() > ASYNC_SEARCH_BYTES
+    }
+
+    /// A background scan is still running: the count is a lower bound.
+    pub fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    /// Start a background scan of `text`: drops the old matches (their
+    /// offsets are for another text) and returns the scan's generation.
+    fn begin_async(&mut self, text: &Rope) -> u64 {
+        self.text = text.clone();
+        self.generation = self.generation.wrapping_add(1);
+        self.pending = self.query.is_some();
+        self.scanned.clear();
+        self.scanned_to = 0;
+        self.quick.clear();
+        self.matched_ranges = Rc::new(Vec::new());
+        self.current_match_ix = 0;
+        self.replacing = false;
+        self.generation
+    }
+
+    /// The on-screen matches, shown before the scan gets there; the current
+    /// match is the first at or after `anchor`.
+    fn set_quick(&mut self, quick: Vec<Range<usize>>, anchor: Option<usize>) {
+        self.quick = quick;
+        self.publish(anchor.or_else(|| self.quick.first().map(|r| r.start)));
+    }
+
+    /// Add a batch of scan `generation` that reached `scanned_to`. Returns
+    /// false when the batch is stale (a newer scan started).
+    fn apply_batch(
+        &mut self,
+        generation: u64,
+        mut batch: Vec<Range<usize>>,
+        scanned_to: usize,
+        done: bool,
+    ) -> bool {
+        if generation != self.generation || !self.pending {
+            return false;
+        }
+        let keep = self
+            .matched_ranges
+            .get(self.current_match_ix)
+            .map(|r| r.start);
+        self.scanned.append(&mut batch);
+        self.scanned_to = scanned_to;
+        if done {
+            self.pending = false;
+            self.quick.clear();
+        }
+        self.publish(keep);
+        true
+    }
+
+    /// matched_ranges = what the scan found + the on-screen matches past
+    /// it; the current match stays on the match at or after `keep`.
+    fn publish(&mut self, keep: Option<usize>) {
+        let mut ranges = self.scanned.clone();
+        let scanned_to = self.scanned_to;
+        ranges.extend(self.quick.iter().filter(|r| r.start >= scanned_to).cloned());
+        self.matched_ranges = Rc::new(ranges);
+        self.current_match_ix = match keep {
+            Some(offset) => self
+                .matched_ranges
+                .partition_point(|r| r.start < offset)
+                .min(self.len().saturating_sub(1)),
+            None => 0,
+        };
     }
 
     /// Update the source text and recompute matches.
@@ -339,6 +575,12 @@ impl SearchMatcher {
                 .build([query])
                 .expect("failed to build input search query")
         });
+        if Self::is_async_for(&self.text) {
+            // The owner schedules the background scan; scanning here would
+            // stall the UI thread for the whole document.
+            self.begin_async(&self.text.clone());
+            return;
+        }
         self.update_matches();
     }
 
@@ -364,10 +606,13 @@ impl SearchMatcher {
         self.matched_ranges.is_empty()
     }
 
-    /// `2/5`: the current match and the total, `0/0` without matches.
+    /// `2/5`: the current match and the total, `0/0` without matches;
+    /// `2/≥5` while a background scan is still counting.
     pub fn label(&self) -> String {
+        let more = if self.pending { "≥" } else { "" };
         match self.current() {
-            Some(ix) => format!("{}/{}", ix + 1, self.len()),
+            Some(ix) => format!("{}/{more}{}", ix + 1, self.len()),
+            None if self.pending => "0/…".into(),
             None => "0/0".into(),
         }
     }
@@ -382,12 +627,12 @@ impl SearchMatcher {
     }
 
     pub fn update_cursor_by_offset(&mut self, offset: usize) {
-        for (ix, range) in self.matched_ranges.iter().enumerate() {
-            self.current_match_ix = ix;
-            if range.contains(&offset) || range.end >= offset {
-                return;
-            }
+        if self.is_empty() {
+            return;
         }
+        // The first match that contains or follows `offset`, else the last.
+        let ix = self.matched_ranges.partition_point(|r| r.end < offset);
+        self.current_match_ix = ix.min(self.len() - 1);
     }
 
     /// Preserve the current logical match while a replacement mutates text.
@@ -455,6 +700,74 @@ impl DoubleEndedIterator for SearchMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn query(q: &str, ci: bool) -> AhoCorasick {
+        AhoCorasick::builder()
+            .ascii_case_insensitive(ci)
+            .build([q])
+            .unwrap()
+    }
+
+    #[test]
+    fn batches_find_what_one_scan_finds() {
+        let text = "aa中aaa🙂aXa aaaa\naa中".repeat(50);
+        let rope = Rope::from(text.as_str());
+        for q in ["aa", "a", "中a", "🙂", "aaaa", "x"] {
+            let query = query(q, true);
+            let whole: Vec<_> = query
+                .find_iter(text.as_bytes())
+                .map(|m| m.range())
+                .collect();
+            for batch in [1, 2, 3, 5, 7, 64, 10_000] {
+                let mut found = Vec::new();
+                let mut from = 0;
+                while from < rope.len() {
+                    let (mut part, next) = find_in_range(&rope, &query, from, from + batch);
+                    assert!(next > from, "progress at {from} (batch {batch}, {q})");
+                    found.append(&mut part);
+                    from = next;
+                }
+                assert_eq!(found, whole, "query {q:?}, batch {batch}");
+            }
+        }
+    }
+
+    #[test]
+    fn background_batches_merge_with_the_on_screen_matches() {
+        let mut matcher = SearchMatcher::new();
+        let rope = Rope::from("foo ".repeat(10).as_str());
+        matcher.query = Some(query("foo", false));
+        let generation = matcher.begin_async(&rope);
+        assert!(matcher.is_pending());
+        assert_eq!(matcher.label(), "0/…");
+        // On screen: the matches at 20 and 24; the current one at 24.
+        matcher.set_quick(vec![20..23, 24..27], Some(24));
+        assert_eq!(matcher.label(), "2/≥2");
+        // The scan's first batch (up to 12) comes in: the current match stays.
+        assert!(matcher.apply_batch(generation, vec![0..3, 4..7, 8..11], 12, false));
+        assert_eq!(
+            matcher.matched_ranges()[matcher.current_match_index()],
+            24..27
+        );
+        assert_eq!(matcher.label(), "5/≥5");
+        // A batch of an older scan is ignored.
+        assert!(!matcher.apply_batch(generation - 1, vec![12..15], 16, false));
+        let (rest, next) = find_in_range(&rope, matcher.query.as_ref().unwrap(), 12, rope.len());
+        assert!(matcher.apply_batch(generation, rest, next, true));
+        assert!(!matcher.is_pending());
+        assert_eq!(matcher.len(), 10);
+        assert_eq!(matcher.label(), "7/10");
+    }
+
+    #[test]
+    fn a_big_document_does_not_scan_on_the_query_change() {
+        let mut matcher = SearchMatcher::new();
+        let big = Rope::from("x".repeat(ASYNC_SEARCH_BYTES + 1).as_str());
+        matcher.update(&big);
+        matcher.update_query("x", false);
+        assert!(matcher.is_pending());
+        assert!(matcher.is_empty());
+    }
 
     #[test]
     fn finds_navigates_and_preserves_replacement_position() {

@@ -363,6 +363,9 @@ pub struct InputBaseState<M: InputModeKind> {
     /// pointer position at the press.
     pub(super) pressed_token: Option<(usize, u64, Point<Pixels>)>,
     pub(super) search_session: super::SearchSession,
+    /// The background scan of a big document's search (see
+    /// `ASYNC_SEARCH_BYTES`); dropping it cancels it.
+    pub(super) search_task: Option<gpui::Task<()>>,
     /// Advances every time search is explicitly invoked. See
     /// [`InputBaseState::search_activation_revision`].
     pub(super) search_activation_revision: u64,
@@ -705,6 +708,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             text: "".into(),
             display_map: DisplayMap::new(text_style.font(), window.rem_size(), None),
             search_session: super::SearchSession::default(),
+            search_task: None,
             search_activation_revision: 0,
             searchable: false,
             replaceable: true,
@@ -2962,6 +2966,14 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Visible row range in the last laid-out viewport, `None` before first layout.
     pub fn visible_row_range(&self) -> Option<std::ops::Range<usize>> {
         self.last_layout.as_ref().map(|l| l.visible_range.clone())
+    }
+
+    /// Byte range of the text in the last laid-out viewport, `None` before
+    /// the first layout (e.g. to draw only the search matches on screen).
+    pub fn visible_range_offset(&self) -> Option<std::ops::Range<usize>> {
+        self.last_layout
+            .as_ref()
+            .map(|l| l.visible_range_offset.clone())
     }
 
     /// Current scroll offset of the editor viewport.
@@ -10212,7 +10224,7 @@ impl InputBaseState<crate::input::EditorMode> {
         self.display_map.fold_candidates()
     }
 
-        /// Unfold any folded ranges that hide the given position.
+    /// Unfold any folded ranges that hide the given position.
     ///
     /// Use this to reveal a position before acting on it (e.g. before
     /// [`Self::set_cursor_position`], which stops at a fold boundary),
