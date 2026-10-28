@@ -4,8 +4,8 @@ use std::ops::Range;
 
 use gpui::{
     App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, Half,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, Styled, Subscription,
-    WeakEntity, Window, actions, div, prelude::FluentBuilder as _,
+    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels, Render, Styled,
+    Subscription, WeakEntity, Window, actions, div, prelude::FluentBuilder as _,
 };
 
 use crate::{
@@ -22,7 +22,36 @@ use crate::{
 
 const CONTEXT: &'static str = "SearchPanel";
 
-actions!(input, [Tab]);
+actions!(
+    input,
+    [
+        Tab,
+        /// Find: toggle Match Case (Aa).
+        ToggleSearchCaseSensitive,
+        /// Find: toggle Match Whole Word (ab).
+        ToggleSearchWholeWord,
+        /// Find: toggle Use Regular Expression (.*).
+        ToggleSearchRegex
+    ]
+);
+
+/// VS Code's Find widget keys: Alt+C, Alt+W, Alt+R (Cmd+Alt on macOS).
+pub(crate) fn init(cx: &mut App) {
+    cx.bind_keys([
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-c", ToggleSearchCaseSensitive, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-w", ToggleSearchWholeWord, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-r", ToggleSearchRegex, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-c", ToggleSearchCaseSensitive, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-w", ToggleSearchWholeWord, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-r", ToggleSearchRegex, Some(CONTEXT)),
+    ]);
+}
 
 #[cfg(test)]
 use gpui_base::input::SearchMatcher;
@@ -94,8 +123,8 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        let search_input = cx.new(|cx| InputState::new(window, cx));
-        let replace_input = cx.new(|cx| InputState::new(window, cx));
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Find"));
+        let replace_input = cx.new(|cx| InputState::new(window, cx).placeholder("Replace"));
 
         cx.new(|cx| {
             let _subscriptions =
@@ -105,6 +134,11 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
                         match ev {
                             InputEvent::Change => {
                                 this.update_search_query(None, cx);
+                                // Find as you type: the editor follows the query.
+                                let _ = this.editor.update(cx, |state, cx| {
+                                    _ = state.reveal_search_match_from_selection(cx);
+                                });
+                                this.sync_from_editor(cx);
                             }
                             _ => {}
                         }
@@ -161,8 +195,9 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
     ) {
         let query = self.search_input.read(cx).value();
         let editor = self.editor.clone();
+        let options = self.session.options();
         let _ = editor.update(cx, |state, cx| {
-            state.set_search_query(query.clone(), self.session.case_insensitive, cx);
+            state.set_search_query_with(query.clone(), options, cx);
         });
         if let Ok(session) = editor.read_with(cx, |state, _| state.search_session().clone()) {
             self.session = session;
@@ -173,6 +208,31 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
                 .update_cursor_by_offset(visible_range_offset.start);
         }
         cx.notify();
+    }
+
+    fn sync_from_editor(&mut self, cx: &mut Context<Self>) {
+        if let Ok(session) = self
+            .editor
+            .read_with(cx, |state, _| state.search_session().clone())
+        {
+            self.session = session;
+        }
+        cx.notify();
+    }
+
+    fn toggle_case_sensitive(&mut self, cx: &mut Context<Self>) {
+        self.session.case_insensitive = !self.session.case_insensitive;
+        self.update_search_query(None, cx);
+    }
+
+    fn toggle_whole_word(&mut self, cx: &mut Context<Self>) {
+        self.session.whole_word = !self.session.whole_word;
+        self.update_search_query(None, cx);
+    }
+
+    fn toggle_regex(&mut self, cx: &mut Context<Self>) {
+        self.session.regex = !self.session.regex;
+        self.update_search_query(None, cx);
     }
 
     fn replaceable(&self, cx: &App) -> bool {
@@ -320,6 +380,17 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
         }
 
         let has_matches = !self.session.matcher.is_empty();
+        let error = self.session.matcher.error().map(|e| e.to_string());
+        let toggle = |id: &'static str, label: &'static str, on: bool, tip: &'static str| {
+            Button::new(id)
+                .selected(on)
+                .toggled(on)
+                .xsmall()
+                .compact()
+                .text()
+                .label(label)
+                .tooltip(tip)
+        };
         let allow_replace = self.replaceable(cx);
         if !allow_replace {
             self.session.replace_mode = false;
@@ -335,6 +406,13 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
             .on_action(cx.listener(Self::on_action_tab))
             .on_action(cx.listener(Self::on_action_tab_prev))
             .on_action(cx.listener(Self::on_action_replace))
+            .on_action(cx.listener(|this, _: &ToggleSearchCaseSensitive, _, cx| {
+                this.toggle_case_sensitive(cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &ToggleSearchWholeWord, _, cx| this.toggle_whole_word(cx)),
+            )
+            .on_action(cx.listener(|this, _: &ToggleSearchRegex, _, cx| this.toggle_regex(cx)))
             .font_family(cx.theme().font_family.clone())
             .items_center()
             .py_2()
@@ -357,20 +435,47 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                             .child(
                                 Input::new(&self.search_input)
                                     .focus_bordered(false)
+                                    .when(error.is_some(), |input| {
+                                        input.border_color(cx.theme().danger)
+                                    })
                                     .suffix(
-                                        Button::new("case-insensitive")
-                                            .selected(!self.session.case_insensitive)
-                                            .toggled(!self.session.case_insensitive)
-                                            .xsmall()
-                                            .compact()
-                                            .text()
-                                            .icon(IconName::CaseSensitive)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.session.case_insensitive =
-                                                    !this.session.case_insensitive;
-                                                this.update_search_query(None, cx);
-                                                cx.notify();
-                                            })),
+                                        h_flex()
+                                            .gap_0p5()
+                                            .child(
+                                                Button::new("case-insensitive")
+                                                    .selected(!self.session.case_insensitive)
+                                                    .toggled(!self.session.case_insensitive)
+                                                    .xsmall()
+                                                    .compact()
+                                                    .text()
+                                                    .icon(IconName::CaseSensitive)
+                                                    .tooltip("Match Case (Alt+C)")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.toggle_case_sensitive(cx);
+                                                    })),
+                                            )
+                                            .child(
+                                                toggle(
+                                                    "whole-word",
+                                                    "ab",
+                                                    self.session.whole_word,
+                                                    "Match Whole Word (Alt+W)",
+                                                )
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.toggle_whole_word(cx);
+                                                })),
+                                            )
+                                            .child(
+                                                toggle(
+                                                    "regex",
+                                                    ".*",
+                                                    self.session.regex,
+                                                    "Use Regular Expression (Alt+R)",
+                                                )
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.toggle_regex(cx);
+                                                })),
+                                            ),
                                     )
                                     .small()
                                     .w_full()
@@ -435,6 +540,15 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                             })),
                     ),
             )
+            .when_some(error, |this, error| {
+                this.child(
+                    div()
+                        .w_full()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .child(format!("Invalid regular expression: {error}")),
+                )
+            })
             .when(self.session.replace_mode && allow_replace, |this| {
                 this.child(
                     h_flex()

@@ -1,10 +1,12 @@
 use crate::input::InputModeKind;
-use aho_corasick::AhoCorasick;
 use gpui::{Context, Window};
 use ropey::Rope;
 use std::{ops::Range, rc::Rc, time::Duration};
 use sum_tree::Bias;
 
+pub use super::search_query::{
+    REGEX_REACH, SearchOptions, SearchQuery, expand_replacement, find_in_str,
+};
 use super::{
     InputBaseState, Replace, RopeExt as _, Search, movement::MoveDirection, state::ScrollPadding,
 };
@@ -26,7 +28,9 @@ const QUICK_SCAN_BYTES: usize = 256 << 10;
 #[derive(Debug, Clone)]
 pub struct SearchMatcher {
     text: Rope,
-    pub query: Option<AhoCorasick>,
+    pub query: Option<SearchQuery>,
+    /// Why the query has no matcher: an invalid regular expression.
+    error: Option<String>,
     matched_ranges: Rc<Vec<Range<usize>>>,
     current_match_ix: usize,
     replacing: bool,
@@ -47,26 +51,26 @@ pub struct SearchMatcher {
 /// match that runs over it, so batches together find what one scan would.
 pub fn find_in_range(
     text: &Rope,
-    query: &AhoCorasick,
+    query: &SearchQuery,
     from: usize,
     to: usize,
 ) -> (Vec<Range<usize>>, usize) {
     let len = text.len();
     let from = text.clip_offset(from.min(len), Bias::Left);
     let to = text.clip_offset(to.min(len), Bias::Right).max(from);
-    let end = text.clip_offset((to + query.max_pattern_len()).min(len), Bias::Right);
-    let haystack = text.slice(from..end).to_string();
-    let mut found = Vec::new();
-    let mut next = to;
-    for m in query.find_iter(haystack.as_bytes()) {
-        let range = from + m.start()..from + m.end();
-        if range.start >= to {
-            break;
-        }
-        next = next.max(range.end);
-        found.push(range);
-    }
-    (found, next)
+    // The slice around the batch: a little before (for `^`, `\b`, whole
+    // words) and as far as the longest match after.
+    let start = text.clip_offset(from.saturating_sub(16), Bias::Left);
+    let end = text.clip_offset((to + query.max_match_len() + 4).min(len), Bias::Right);
+    let haystack = text.slice(start..end).to_string();
+    let (found, next) = find_in_str(&haystack, query, from - start, to - start);
+    (
+        found
+            .into_iter()
+            .map(|r| start + r.start..start + r.end)
+            .collect(),
+        start + next,
+    )
 }
 
 /// One search over an input: the query, how the built-in panel shows it, and
@@ -80,6 +84,10 @@ pub struct SearchSession {
     pub open: bool,
     pub replace_mode: bool,
     pub case_insensitive: bool,
+    /// ab: whole words only.
+    pub whole_word: bool,
+    /// .*: the query is a regular expression.
+    pub regex: bool,
     pub query: String,
     pub replacement: String,
     pub anchor_offset: Option<usize>,
@@ -96,6 +104,8 @@ impl Default for SearchSession {
             active: false,
             replace_mode: false,
             case_insensitive: true,
+            whole_word: false,
+            regex: false,
             query: String::new(),
             replacement: String::new(),
             anchor_offset: None,
@@ -130,15 +140,35 @@ impl SearchSession {
         self.active
     }
 
+    #[cfg(test)]
     pub(crate) fn update_query(&mut self, query: impl Into<String>, case_insensitive: bool) {
+        let options = SearchOptions {
+            case_sensitive: !case_insensitive,
+            ..self.options()
+        };
+        self.update_query_with(query, options);
+    }
+
+    /// The toggles as one value.
+    pub fn options(&self) -> SearchOptions {
+        SearchOptions {
+            case_sensitive: !self.case_insensitive,
+            whole_word: self.whole_word,
+            regex: self.regex,
+        }
+    }
+
+    pub(crate) fn update_query_with(&mut self, query: impl Into<String>, options: SearchOptions) {
         let query = query.into();
-        if self.query == query && self.case_insensitive == case_insensitive {
+        if self.query == query && self.options() == options {
             return;
         }
 
         self.query = query;
-        self.case_insensitive = case_insensitive;
-        self.matcher.update_query(&self.query, case_insensitive);
+        self.case_insensitive = !options.case_sensitive;
+        self.whole_word = options.whole_word;
+        self.regex = options.regex;
+        self.matcher.update_query_with(&self.query, options);
     }
 }
 
@@ -175,8 +205,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         } else {
             None
         };
-        let case_insensitive = self.search_session.case_insensitive;
-        self.search_session.update_query(query, case_insensitive);
+        let options = self.search_session.options();
+        self.search_session.update_query_with(query, options);
         if SearchMatcher::is_async_for(&self.text) {
             if query_changed || self.search_session.matcher.text.len() != self.text.len() {
                 let anchor = self.search_session.anchor_offset;
@@ -234,11 +264,27 @@ impl<M: InputModeKind> InputBaseState<M> {
         case_insensitive: bool,
         cx: &mut Context<Self>,
     ) {
+        let options = SearchOptions {
+            case_sensitive: !case_insensitive,
+            ..self.search_session.options()
+        };
+        self.set_search_query_with(query, options, cx);
+    }
+
+    /// [`InputBaseState::set_search_query`] with every toggle: match case,
+    /// whole word and regular expression. An invalid regular expression
+    /// finds nothing; [`SearchMatcher::error`] says why.
+    pub fn set_search_query_with(
+        &mut self,
+        query: impl Into<String>,
+        options: SearchOptions,
+        cx: &mut Context<Self>,
+    ) {
         self.search_session.activate();
         let query = query.into();
-        let changed = query != self.search_session.query
-            || case_insensitive != self.search_session.case_insensitive;
-        self.search_session.update_query(query, case_insensitive);
+        let changed =
+            query != self.search_session.query || options != self.search_session.options();
+        self.search_session.update_query_with(query, options);
         if SearchMatcher::is_async_for(&self.text) {
             if changed || self.search_session.matcher.text.len() != self.text.len() {
                 let anchor = self
@@ -336,6 +382,31 @@ impl<M: InputModeKind> InputBaseState<M> {
         Some(range)
     }
 
+    /// Find as you type (VS Code): select the first match at or after the
+    /// selection's start and scroll it into view, so the editor follows the
+    /// query while it is typed. Returns the match, if any.
+    pub fn reveal_search_match_from_selection(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.sync_search_matcher();
+        let from = self.selected_range().start;
+        let matcher = &mut self.search_session.matcher;
+        if matcher.is_empty() {
+            return None;
+        }
+        let ix = matcher.matched_ranges().partition_point(|r| r.start < from);
+        if ix >= matcher.len() && matcher.is_pending() {
+            // Past what a big document's scan has found so far.
+            return None;
+        }
+        matcher.set_current_match_index(if ix >= matcher.len() { 0 } else { ix });
+        let range = matcher.matched_ranges()[matcher.current_match_index()].clone();
+        self.select_search_match(&range, cx);
+        self.scroll_to_with_padding(range.end, None, ScrollPadding::SurroundingLines, cx);
+        Some(range)
+    }
+
     /// Navigating matches selects the current one (as VS Code does): the
     /// caret and status follow it, and closing Find leaves it selected.
     fn select_search_match(&mut self, range: &Range<usize>, cx: &mut Context<Self>) {
@@ -369,10 +440,28 @@ impl<M: InputModeKind> InputBaseState<M> {
         if direction.is_none() {
             matcher.set_current_match_index(0);
         }
+        let replacement = match matcher.query.as_ref() {
+            Some(query) if query.options().regex => {
+                let start = self
+                    .text
+                    .clip_offset(range.start.saturating_sub(16), Bias::Left);
+                let end = self
+                    .text
+                    .clip_offset((range.end + REGEX_REACH).min(self.text.len()), Bias::Right);
+                let haystack = self.text.slice(start..end).to_string();
+                query.replacement(
+                    &haystack,
+                    range.start - start..range.end - start,
+                    replacement,
+                )
+            }
+            _ => replacement.to_string(),
+        };
+        let matcher = &mut self.search_session.matcher;
         matcher.begin_replacement();
         let range_utf16 = self.range_to_utf16(&range);
         self.scroll_to(next.end, direction, cx);
-        self.replace_text_in_range_silent(Some(range_utf16), replacement, window, cx);
+        self.replace_text_in_range_silent(Some(range_utf16), &replacement, window, cx);
         true
     }
 
@@ -403,8 +492,19 @@ impl<M: InputModeKind> InputBaseState<M> {
             return 0;
         }
         let mut text = self.text.clone();
+        let query = self.search_session.matcher.query.clone();
+        let whole = query
+            .as_ref()
+            .filter(|query| query.options().regex)
+            .map(|_| self.text.to_string());
         for range in ranges.iter().rev() {
-            text.replace(range.clone(), replacement);
+            match (&query, &whole) {
+                (Some(query), Some(whole)) => {
+                    let expanded = query.replacement(whole, range.clone(), replacement);
+                    text.replace(range.clone(), &expanded);
+                }
+                _ => text.replace(range.clone(), replacement),
+            }
         }
         self.search_session.matcher.begin_replacement();
         let count = ranges.len();
@@ -480,6 +580,7 @@ impl SearchMatcher {
         Self {
             text: "".into(),
             query: None,
+            error: None,
             matched_ranges: Rc::new(Vec::new()),
             current_match_ix: 0,
             replacing: false,
@@ -577,12 +678,25 @@ impl SearchMatcher {
     }
 
     pub fn update_query(&mut self, query: &str, case_insensitive: bool) {
-        self.query = (!query.is_empty()).then(|| {
-            AhoCorasick::builder()
-                .ascii_case_insensitive(case_insensitive)
-                .build([query])
-                .expect("failed to build input search query")
-        });
+        self.update_query_with(
+            query,
+            SearchOptions {
+                case_sensitive: !case_insensitive,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Why the query finds nothing: the regular expression does not parse.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub fn update_query_with(&mut self, query: &str, options: SearchOptions) {
+        (self.query, self.error) = match SearchQuery::new(query, options) {
+            Ok(query) => (query, None),
+            Err(err) => (None, Some(err)),
+        };
         if Self::is_async_for(&self.text) {
             // The owner schedules the background scan; scanning here would
             // stall the UI thread for the whole document.
@@ -666,11 +780,7 @@ impl SearchMatcher {
         let mut ranges = Vec::new();
         if let Some(query) = &self.query {
             let text = self.text.to_string();
-            ranges.extend(
-                query
-                    .stream_find_iter(text.as_bytes())
-                    .map(|result| result.expect("input search match").range()),
-            );
+            ranges.extend(query.find_iter(&text));
         }
         self.matched_ranges = Rc::new(ranges);
         if !self.replacing || self.is_empty() {
@@ -709,11 +819,16 @@ impl DoubleEndedIterator for SearchMatcher {
 mod tests {
     use super::*;
 
-    fn query(q: &str, ci: bool) -> AhoCorasick {
-        AhoCorasick::builder()
-            .ascii_case_insensitive(ci)
-            .build([q])
-            .unwrap()
+    fn query(q: &str, ci: bool) -> SearchQuery {
+        SearchQuery::new(
+            q,
+            SearchOptions {
+                case_sensitive: !ci,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap()
     }
 
     #[test]
@@ -722,10 +837,7 @@ mod tests {
         let rope = Rope::from(text.as_str());
         for q in ["aa", "a", "中a", "🙂", "aaaa", "x"] {
             let query = query(q, true);
-            let whole: Vec<_> = query
-                .find_iter(text.as_bytes())
-                .map(|m| m.range())
-                .collect();
+            let whole: Vec<_> = query.find_iter(&text).collect();
             for batch in [1, 2, 3, 5, 7, 64, 10_000] {
                 let mut found = Vec::new();
                 let mut from = 0;
@@ -818,6 +930,35 @@ mod tests {
         assert!(!session.open);
         session.close();
         assert!(!session.is_active());
+    }
+
+    #[test]
+    fn regex_and_whole_word_toggles_and_an_invalid_pattern() {
+        let mut session = SearchSession::default();
+        session
+            .matcher
+            .update(&Rope::from("foo(a, b) foo(c,d) food foo"));
+        let regex = SearchOptions {
+            regex: true,
+            ..session.options()
+        };
+        session.update_query_with(r"foo\((\w+), ?(\w+)\)", regex);
+        assert_eq!(session.matcher.label(), "1/2");
+        assert!(session.matcher.error().is_none());
+        // Typing on into an unfinished pattern finds nothing and says why.
+        session.update_query_with("foo(", regex);
+        assert_eq!(session.matcher.label(), "0/0");
+        assert!(session.matcher.error().is_some());
+        session.update_query_with(
+            "foo",
+            SearchOptions {
+                whole_word: true,
+                ..Default::default()
+            },
+        );
+        assert!(session.matcher.error().is_none());
+        assert_eq!(&*session.matcher.matched_ranges(), &[0..3, 10..13, 24..27]);
+        assert!(session.whole_word && !session.regex && session.case_insensitive);
     }
 
     #[test]

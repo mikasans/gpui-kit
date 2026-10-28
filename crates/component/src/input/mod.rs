@@ -13,6 +13,7 @@ mod otp_input;
 mod overlay;
 pub(crate) mod popovers;
 mod search;
+pub use search::{ToggleSearchCaseSensitive, ToggleSearchRegex, ToggleSearchWholeWord};
 mod syntax_context;
 
 pub(crate) use clear_button::*;
@@ -59,4 +60,5 @@ pub use textarea::Textarea;
 
 pub(crate) fn init(cx: &mut gpui::App) {
     language_config::init(cx);
+    search::init(cx);
 }

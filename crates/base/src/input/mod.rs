@@ -64,6 +64,8 @@ mod native;
 mod rope_ext;
 #[path = "editor/search.rs"]
 mod search;
+#[path = "editor/search_query.rs"]
+mod search_query;
 #[path = "base/selection.rs"]
 mod selection;
 #[path = "base/state.rs"]
@@ -118,6 +120,9 @@ pub use native::set_text_content_type;
 pub use native::{NativeMenu, NativeMenuItem};
 pub use rope_ext::{InputEdit, Point, RopeExt, RopeLines};
 pub use ropey::Rope;
-pub use search::{ASYNC_SEARCH_BYTES, SearchMatcher, SearchSession, find_in_range};
+pub use search::{
+    ASYNC_SEARCH_BYTES, REGEX_REACH, SearchMatcher, SearchOptions, SearchQuery, SearchSession,
+    expand_replacement, find_in_range, find_in_str,
+};
 pub use state::*;
 pub use textarea::{Textarea, TextareaState};
