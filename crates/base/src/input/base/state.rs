@@ -2840,13 +2840,12 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.scroll_to(self.cursor(), None, cx);
     }
 
-    /// The intent of a batch the caller did not label: inserting text at
-    /// collapsed cursors is typing, anything else stands on its own.
-    fn typing_intent(&self, edits: &[(Range<usize>, String)], new_text: &str) -> EditIntent {
-        if !new_text.is_empty()
-            && !new_text.contains(['\n', '\r'])
-            && edits.iter().all(|(range, _)| range.is_empty())
-        {
+    /// The intent of a batch the caller did not label: inserting text at the
+    /// cursors, or over their selections, is typing; anything else stands on
+    /// its own. Typing over a selection starts a new undo step that the keys
+    /// after it join (VS Code), so one undo brings the selection back.
+    fn typing_intent(&self, _edits: &[(Range<usize>, String)], new_text: &str) -> EditIntent {
+        if !new_text.is_empty() && !new_text.contains(['\n', '\r']) {
             EditIntent::Typing
         } else {
             EditIntent::Atomic
@@ -2892,11 +2891,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         let new_range = range.start..range.start + new_text.len();
 
         let intent = requested_intent.unwrap_or_else(|| {
-            if range.is_empty()
-                && old_text.is_empty()
-                && !new_text.is_empty()
-                && !new_text.contains(['\n', '\r'])
-            {
+            if !new_text.is_empty() && !new_text.contains(['\n', '\r']) {
                 EditIntent::Typing
             } else {
                 EditIntent::Atomic
@@ -6603,7 +6598,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_undo_manager_selected_replacement_is_atomic(cx: &mut TestAppContext) {
+    fn test_undo_manager_typing_over_a_selection_is_one_step_with_the_keys_after(
+        cx: &mut TestAppContext,
+    ) {
         let input_view = InputView::build(cx, |state| state);
         let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
         let input = input_view.input;
@@ -6616,8 +6613,7 @@ mod tests {
                 state.replace_text_in_range(None, "z", window, cx);
                 assert_eq!(state.value(), "aXzc");
 
-                state.undo(&Undo, window, cx);
-                assert_eq!(state.value(), "aXc");
+                // VS Code: the selection comes back in one undo.
                 state.undo(&Undo, window, cx);
                 assert_eq!(state.value(), "abc");
                 state.undo(&Undo, window, cx);
@@ -9371,6 +9367,30 @@ mod tests {
             input.update(cx, |state, cx| state.escape(&Escape, window, cx));
         });
         input.read_with(&cx, |state, _| assert_eq!(state.selection_count(), 1));
+    }
+
+    #[gpui::test]
+    fn test_typing_over_a_selection_undoes_in_one_step(cx: &mut TestAppContext) {
+        let view = multi_line(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+
+        setup_cursors(&mut cx, &input, "hello world|");
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                let id = state.selections.generate_id();
+                state
+                    .selections
+                    .replace_all(vec![CursorSelection::new(id, 0, 5)]);
+                state.undo_manager.break_transaction_coalescing();
+                for key in ["a", "b", "c"] {
+                    state.replace_text_in_range(None, key, window, cx);
+                }
+                assert_eq!(state.text.to_string().trim_end(), "abc world");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.text.to_string().trim_end(), "hello world");
+            });
+        });
     }
 
     #[gpui::test]

@@ -439,9 +439,10 @@ fn is_adjacent(intent: EditIntent, previous: &Change, current: &Change) -> bool 
         return false;
     }
     match intent {
+        // The first key may type over a selection (VS Code: the keys that
+        // follow are the same edit, and one undo brings the selection back).
         EditIntent::Typing => {
-            previous.old_range.is_empty()
-                && current.old_range.is_empty()
+            current.old_range.is_empty()
                 && !previous.new_text.contains(['\n', '\r'])
                 && !current.new_text.contains(['\n', '\r'])
                 && previous.new_range.end == current.old_range.start
@@ -477,6 +478,21 @@ mod tests {
 
         // The run is kept as one insertion, so undo replays a single change.
         assert_eq!(manager.undo().unwrap().changes, [typing_change(0, "ab")]);
+        assert!(manager.undo().is_none());
+    }
+
+    #[test]
+    fn typing_over_a_selection_and_on_is_one_undo_step() {
+        let mut manager = UndoManager::new();
+        // "hello" selected at 0..5, then "a", "b", "c" typed.
+        manager.record_transaction(Change::new(0..5, "hello", 0..1, "a"), EditIntent::Typing);
+        manager.record_transaction(typing_change(1, "b"), EditIntent::Typing);
+        manager.record_transaction(typing_change(2, "c"), EditIntent::Typing);
+
+        assert_eq!(
+            manager.undo().unwrap().changes,
+            [Change::new(0..5, "hello", 0..3, "abc")]
+        );
         assert!(manager.undo().is_none());
     }
 
